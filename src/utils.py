@@ -32,13 +32,15 @@ def avi2video(video_path):
 # get ed and es dataframe for file name
 def extract_ed_es_tracings(df_tracings, file_name):
     subject_tracings = df_tracings[df_tracings['FileName'] == file_name]
-    
+    if len(subject_tracings) < 1:
+        print(file_name)
     frames_ed, frames_es = subject_tracings['Frame'].unique()[0], subject_tracings['Frame'].unique()[1]
 
     df_ed = subject_tracings[subject_tracings['Frame'] == frames_ed]
     df_es = subject_tracings[subject_tracings['Frame'] == frames_es]
     
-    return df_ed, df_es
+    return df_ed, df_es, frames_ed, frames_es
+
 
 # visualize long and short axis from coordinates 
 def plot_long_short_axis(one_phase_df):
@@ -98,6 +100,35 @@ def binary_mask_from_tracings(one_phase_df):
     mask = np.zeros((height, width), dtype=np.uint8)
 
     cv2.fillPoly(mask, [contour_points], 1) # Use 1 for the mask value (or 255)
+
+    return mask
+
+def binary_mask_from_pediatric_tracings(one_frame_df):
+    """
+    Generates a binary segmentation mask from EchoNet Pediatric tracings for a single frame.
+
+    Args:
+        one_frame_df (pd.DataFrame): A DataFrame containing the tracing coordinates
+                                     for a single video frame. It must have 'X' and 'Y'
+                                     columns.
+
+    Returns:
+        np.ndarray: A 112x112 binary mask (uint8) with the segmented region filled with 1.
+    """
+    # The (X, Y) coordinates already form the contour.
+    # We just need to extract them as a NumPy array.
+    contour_points = one_frame_df[['X', 'Y']].values
+
+    # Convert points to integer type for cv2.fillPoly
+    contour_points = contour_points.astype(np.int32)
+
+    # Define the mask dimensions (as in your original function)
+    height, width = 112, 112
+    mask = np.zeros((height, width), dtype=np.uint8)
+
+    # cv2.fillPoly expects a list of contours. In our case, it's a list with one contour.
+    # We fill the polygon defined by the points with the value 1.
+    cv2.fillPoly(mask, [contour_points], 1)
 
     return mask
 
@@ -409,163 +440,36 @@ def extract_lv_axes(binary_mask, num_short_axes=20):
     
     return pd.DataFrame(data)
 
-
-# def extract_lv_axes(binary_mask, num_short_axes=20):
-#     """
-#     Extract long axis (apex to base) and short axes from a binary mask of the left ventricle.
-    
-#     Parameters:
-#     -----------
-#     binary_mask : numpy.ndarray
-#         Binary mask of the left ventricle (2D array with values 0 or 1)
-#     num_short_axes : int
-#         Number of short axes to generate along the long axis
-    
-#     Returns:
-#     --------
-#     pd.DataFrame
-#         DataFrame with columns X1, Y1, X2, Y2 where:
-#         - First row: apex (X1,Y1) and base (X2,Y2) coordinates
-#         - Subsequent rows: endpoints of short axes
-#     """
-    
-#     # Ensure binary mask is uint8
-#     mask = (binary_mask > 0).astype(np.uint8)
-    
-#     # Find contours
-#     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-    
-#     if len(contours) == 0:
-#         raise ValueError("No contours found in the binary mask")
-    
-#     # Get the largest contour (in case there are multiple)
-#     contour = max(contours, key=cv2.contourArea)
-#     contour_points = contour.squeeze()
-    
-#     # If contour has wrong shape, reshape it
-#     if len(contour_points.shape) == 3:
-#         contour_points = contour_points.squeeze()
-    
-#     # Calculate centroid
-#     M = cv2.moments(contour)
-#     if M["m00"] == 0:
-#         raise ValueError("Cannot compute centroid - zero area")
-    
-#     cx = int(M["m10"] / M["m00"])
-#     cy = int(M["m01"] / M["m00"])
-#     centroid = np.array([cx, cy])
-    
-#     # Find apex: furthest point from centroid
-#     distances_from_centroid = np.sqrt(np.sum((contour_points - centroid)**2, axis=1))
-#     apex_idx = np.argmax(distances_from_centroid)
-#     apex = contour_points[apex_idx]
-    
-#     # Find base: look for points on the opposite side of the centroid from apex
-#     # Vector from centroid to apex
-#     apex_vector = apex - centroid
-    
-#     # For each contour point, calculate the angle with the apex vector
-#     angles = []
-#     for point in contour_points:
-#         point_vector = point - centroid
-#         # Calculate angle using dot product
-#         cos_angle = np.dot(apex_vector, point_vector) / (
-#             np.linalg.norm(apex_vector) * np.linalg.norm(point_vector) + 1e-10
-#         )
-#         angles.append(np.arccos(np.clip(cos_angle, -1, 1)))
-    
-#     angles = np.array(angles)
-    
-#     # Base should be roughly opposite to apex (angle close to π)
-#     # Look for points with angles between 2π/3 and π
-#     opposite_mask = (angles > 2*np.pi/3) & (angles <= np.pi)
-    
-#     if np.sum(opposite_mask) == 0:
-#         # If no points found in that range, take the point with maximum angle
-#         base_idx = np.argmax(angles)
-#     else:
-#         # Among opposite points, find the one that creates the longest axis
-#         opposite_indices = np.where(opposite_mask)[0]
-#         distances_to_apex = np.sqrt(np.sum((contour_points[opposite_indices] - apex)**2, axis=1))
-#         base_idx = opposite_indices[np.argmax(distances_to_apex)]
-    
-#     base = contour_points[base_idx]
-    
-#     # Create the long axis vector
-#     long_axis_vector = base - apex
-#     long_axis_length = np.linalg.norm(long_axis_vector)
-#     long_axis_unit = long_axis_vector / long_axis_length
-    
-#     # Generate short axes perpendicular to the long axis
-#     short_axes = []
-    
-#     # Create perpendicular vector (rotate by 90 degrees)
-#     perpendicular = np.array([-long_axis_unit[1], long_axis_unit[0]])
-    
-#     # Sample points along the long axis (excluding apex and base)
-#     for i in range(1, num_short_axes + 1):
-#         # Position along the long axis (from 0 to 1)
-#         t = i / (num_short_axes + 1)
-        
-#         # Point on the long axis
-#         point_on_axis = apex + t * long_axis_vector
-        
-#         # Find intersections of perpendicular line with contour
-#         # Create a long perpendicular line
-#         line_length = max(mask.shape) * 2
-#         line_start = point_on_axis - perpendicular * line_length
-#         line_end = point_on_axis + perpendicular * line_length
-        
-#         # Find intersections with the contour
-#         intersections = find_line_contour_intersections(
-#             line_start, line_end, contour_points, point_on_axis
-#         )
-        
-#         if len(intersections) >= 2:
-#             # Get the two intersection points closest to the axis point
-#             distances = np.sqrt(np.sum((intersections - point_on_axis)**2, axis=1))
-            
-#             # Separate points on each side of the long axis
-#             side1_points = []
-#             side2_points = []
-            
-#             for inter_point in intersections:
-#                 # Determine which side of the long axis this point is on
-#                 cross_product = np.cross(long_axis_vector, inter_point - apex)
-#                 if cross_product > 0:
-#                     side1_points.append(inter_point)
-#                 else:
-#                     side2_points.append(inter_point)
-            
-#             # Get closest point from each side
-#             if len(side1_points) > 0 and len(side2_points) > 0:
-#                 side1_point = min(side1_points, 
-#                                 key=lambda p: np.linalg.norm(p - point_on_axis))
-#                 side2_point = min(side2_points, 
-#                                 key=lambda p: np.linalg.norm(p - point_on_axis))
-#                 short_axes.append([side1_point[0], side1_point[1], 
-#                                  side2_point[0], side2_point[1]])
-    
-#     # Create DataFrame
-#     data = []
-    
-#     # First row: apex and base
-#     data.append({
-#         'X1': float(apex[0]),
-#         'Y1': float(apex[1]),
-#         'X2': float(base[0]),
-#         'Y2': float(base[1])
-#     })
-    
-#     # Subsequent rows: short axes
-#     for axis_coords in short_axes:
-#         data.append({
-#             'X1': float(axis_coords[0]),
-#             'Y1': float(axis_coords[1]),
-#             'X2': float(axis_coords[2]),
-#             'Y2': float(axis_coords[3])
-#         })
-    
-#     return pd.DataFrame(data)
-
 ############ End traces from mask estimation
+
+
+# segmentations and frame ids from file name
+def get_segms_from_traces_filename(file_name, path_to_csv):
+
+    # load csv
+    df_tracings = pd.read_csv(path_to_csv)
+
+    # get the according tracings for file name
+    df_ed, df_es, frame_ed, frame_es = extract_ed_es_tracings(df_tracings, file_name)
+
+    # compute the segmentation from tracings 
+    mask_ed = binary_mask_from_tracings(df_ed)
+    mask_es = binary_mask_from_tracings(df_es)
+
+    return mask_ed, mask_es, frame_ed, frame_es
+
+
+def get_segms_from_traces_filename_ped(file_name, path_to_csv):
+
+    # load csv
+    df_tracings = pd.read_csv(path_to_csv)
+
+    # get the according tracings for file name
+    df_es, df_ed, frame_es, frame_ed = extract_ed_es_tracings(df_tracings, file_name)
+
+    # compute the segmentation from tracings 
+    mask_ed = binary_mask_from_pediatric_tracings(df_ed)
+    mask_es = binary_mask_from_pediatric_tracings(df_es)
+
+    return mask_ed, mask_es, frame_ed, frame_es
+
