@@ -4,9 +4,10 @@ import torch.nn.functional as F
 import numpy as np
 import matplotlib.pyplot as plt
 from collections import Counter
+import lightning as L
 from unet.unet_parts import *
 
-class UNet(nn.Module):
+class UNet(L.LightningModule):
     def __init__(self, n_channels, n_classes, bilinear=False, class_weights=None):
         super(UNet, self).__init__()
         self.n_channels = n_channels
@@ -55,6 +56,17 @@ class UNet(nn.Module):
         dice_loss = 1 - dice_score.mean()
 
         return alpha * ce_loss + (1 - alpha) * dice_loss
+    
+    def training_step(self, batch, idx):
+        x, y = batch
+        pred = self.forward(x)
+        loss = self.loss(pred, y)
+        self.log('train_loss', loss)
+        return loss
+    
+    def configure_optimizers(self):
+        optimizer = torch.optim.Adam(self.parameters(), lr=1e-4)
+        return optimizer
 
 
     def make_prediction(self, img):
