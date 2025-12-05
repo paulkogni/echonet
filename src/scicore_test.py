@@ -10,7 +10,7 @@ from lightning.pytorch.loggers import TensorBoardLogger
 # import sys
 # sys.path.insert(0, '../src')
 import utils
-import datasets.echonet_dyn
+import datasets.echonet
 import unet.unet as unet
 
 
@@ -27,6 +27,6 @@ loader_test = datasets.echonet_dyn.load_data_into_loader(6,path_to_data_test)
 model = unet.UNet(1,2)
 
 logger = TensorBoardLogger("tb_logs", name="my_model")
-trainer = L.Trainer(limit_train_batches=100, max_epochs=10, logger=logger)
+trainer = L.Trainer(max_epochs=10, logger=logger)
 
-trainer.fit(model=model, train_dataloaders=loader_train)
+trainer.fit(model=model, train_dataloaders=loader_train, val_dataloaders=loader_val)

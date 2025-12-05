@@ -57,11 +57,113 @@ class UNet(L.LightningModule):
 
         return alpha * ce_loss + (1 - alpha) * dice_loss
     
-    def training_step(self, batch, idx):
+    def dice_coefficient(self, pred, target, smooth=1e-6):
+        """Calculate dice coefficient"""
+        pred_soft = torch.softmax(pred, dim=1)
+        target_one_hot = F.one_hot(target.long(), num_classes=pred.shape[1])
+        target_one_hot = target_one_hot.permute(0, 3, 1, 2).float()
+
+        intersection = torch.sum(pred_soft * target_one_hot, dim=(2, 3))
+        union = torch.sum(pred_soft + target_one_hot, dim=(2, 3))
+        dice_score = (2 * intersection + smooth) / (union + smooth)
+        
+        return dice_score.mean()
+    
+    def create_overlay_image(self, image, mask, alpha=0.5):
+        """
+        Create an overlay visualization of image with segmentation mask
+        
+        Args:
+            image: tensor of shape (C, H, W) - grayscale or RGB
+            mask: tensor of shape (H, W) - segmentation mask with class labels
+            alpha: transparency factor for overlay
+        
+        Returns:
+            RGB image tensor with overlay
+        """
+        # Convert grayscale to RGB if needed
+        if image.shape[0] == 1:
+            image_rgb = image.repeat(3, 1, 1)
+        else:
+            image_rgb = image.clone()
+        
+        # Normalize image to [0, 1] if needed
+        if image_rgb.max() > 1.0:
+            image_rgb = image_rgb / 255.0
+        
+        # Create colored mask (simple colormap: class 0 = background, class 1 = red)
+        colored_mask = torch.zeros(3, mask.shape[0], mask.shape[1], device=mask.device)
+        colored_mask[0][mask == 1] = 1.0  # Red for class 1
+        
+        # Blend image and mask
+        overlay = (1 - alpha) * image_rgb + alpha * colored_mask
+        overlay = torch.clamp(overlay, 0, 1)
+        
+        return overlay
+    
+
+    def log_images(self, batch, pred, stage='train'):
+        """Log images with overlays to tensorboard"""
+        x, y = batch
+        
+        # Only log first image in batch to save space
+        img = x[0].cpu()
+        gt_mask = y[0].cpu()
+        pred_mask = torch.argmax(torch.softmax(pred[0], dim=0), dim=0).cpu()
+        
+        # Create overlays
+        gt_overlay = self.create_overlay_image(img, gt_mask)
+        pred_overlay = self.create_overlay_image(img, pred_mask)
+        
+        # Log to tensorboard
+        self.logger.experiment.add_image(
+            f'{stage}/input_image', 
+            img, 
+            self.current_epoch
+        )
+        self.logger.experiment.add_image(
+            f'{stage}/ground_truth_overlay', 
+            gt_overlay, 
+            self.current_epoch
+        )
+        self.logger.experiment.add_image(
+            f'{stage}/prediction_overlay', 
+            pred_overlay, 
+            self.current_epoch
+        )
+
+    
+    def training_step(self, batch, batch_idx):
         x, y = batch
         pred = self.forward(x)
         loss = self.loss(pred, y)
-        self.log('train_loss', loss)
+        dice = self.dice_coefficient(pred, y)
+        
+        # Log metrics
+        self.log('train_loss', loss, on_step=False, on_epoch=True, prog_bar=True)
+        self.log('train_dice', dice, on_step=False, on_epoch=True, prog_bar=True)
+        
+        # Log images for first batch of each epoch
+        if batch_idx == 0:
+            self.log_images(batch, pred, stage='train')
+        
+        return loss
+    
+
+    def validation_step(self, batch, batch_idx):
+        x, y = batch
+        pred = self.forward(x)
+        loss = self.loss(pred, y)
+        dice = self.dice_coefficient(pred, y)
+        
+        # Log metrics
+        self.log('val_loss', loss, on_step=False, on_epoch=True, prog_bar=True)
+        self.log('val_dice', dice, on_step=False, on_epoch=True, prog_bar=True)
+        
+        # Log images for first batch of each epoch
+        if batch_idx == 0:
+            self.log_images(batch, pred, stage='val')
+        
         return loss
     
     def configure_optimizers(self):
@@ -77,97 +179,3 @@ class UNet(L.LightningModule):
 
 
 
-
-def compute_train_loss_and_train(train_loader, model, optimizer, use_gpu, epoch):
-    model.train()
-    running_loss = 0.0
-
-    for x, y in train_loader:
-        if use_gpu:
-            x = x.cuda()
-            y = y.cuda()
-
-        output = model(x)
-        loss = model.loss(output, y)
-
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-        running_loss += loss * train_loader.batch_size
-        torch.cuda.empty_cache()
-
-    epoch_loss = running_loss / len(train_loader.dataset)
-
-
-    return epoch_loss
-
-
-def compute_eval_loss(test_loader, model, use_gpu, epoch):
-    model.eval()
-    running_loss = 0.0
-    with torch.no_grad():
-        for x, y in test_loader:
-            if use_gpu:
-                x = x.cuda()
-                y = y.cuda()
-            output = model(x)
-            loss = model.loss(output, y)
-            running_loss += loss * test_loader.batch_size
-
-        torch.cuda.empty_cache()
-
-
-    return running_loss / len(test_loader.dataset)
-
-
-def train_model(
-    model,
-    train_loader,
-    eval_loader,
-    optim,
-    epochs=1,
-    save_model=None,
-    save_path=None,
-    continue_training_path=None,
-    wandb_name=None,
-):
-    end_epoch = 0
-    use_gpu = torch.cuda.is_available()
-
-    if continue_training_path:
-        checkpoint = torch.load(continue_training_path)
-        model.load_state_dict(checkpoint["model_state_dict"])
-        if use_gpu:
-            model.cuda()
-        optim.load_state_dict(checkpoint["optimizer_state_dict"])
-        end_epoch = checkpoint["epoch"]
-
-    if use_gpu:
-        model.cuda()
-
-    best_total_eval_loss = np.inf
-
-    for epoch in range(end_epoch, epochs):
-        print("Epoch:", epoch)
-        train_loss = compute_train_loss_and_train(train_loader, model, optim, use_gpu, epoch)
-        eval_loss = compute_eval_loss(eval_loader, model, use_gpu, epoch)
-
-
-        if save_model and eval_loss < best_total_eval_loss:
-            best_total_eval_loss = eval_loss
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optim.state_dict(),
-                    "loss": train_loss,
-                },
-                f"{save_path}unet_seg_best_eval.pth",
-            )
-            print("saving best eval model")
-
-        print("training loss:", train_loss)
-        print("evaluation loss:", eval_loss)
-
-    return

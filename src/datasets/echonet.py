@@ -46,7 +46,7 @@ class EchonetDynamic(Dataset):
 
             return img, segm
          
-def load_data_into_loader(batch_size, path, transform=None):
+def load_data_into_loader(batch_size, path, transform=None, shuffle=True):
     """
     Args:
         batch_size (int)
@@ -59,7 +59,7 @@ def load_data_into_loader(batch_size, path, transform=None):
 
     dataset = EchonetDynamic(path)
 
-    loader = DataLoader(dataset, batch_size=batch_size, drop_last=True, shuffle=True)
+    loader = DataLoader(dataset, batch_size=batch_size, drop_last=True, shuffle=shuffle)
 
     length = len(dataset)
     print("Number of samples:", length)
