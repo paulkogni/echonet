@@ -49,7 +49,7 @@ class EchonetCombined(Dataset):
 
             return img, segm
          
-def load_data_into_loader(batch_size, path_dyn, path_ped, transform=None):
+def load_data_into_loader(batch_size, path_dyn, path_ped, transform=None, shuffle=True):
     """
     Args:
         batch_size (int)
