@@ -1,23 +1,21 @@
 """
 VIDS-Seg: Variational Inference under Distribution Shifts — Segmentation
-PyTorch Implementation
-
-Extended from VIDS (Slavutsky & Blei, NeurIPS 2025) to dense pixel-wise prediction.
+PyTorch Lightning Implementation
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from torch.utils.data import Dataset, DataLoader
-from typing import Optional, Tuple, List, Dict
+import lightning as L
 import math
+from torch.utils.data import DataLoader
+from typing import Optional, Tuple, List, Dict
 from unet.unet_parts import *
 
 
-
 # =============================================================================
-# 2. Embedding Networks
+# 2. Embedding Networks (unchanged — these are used outside Lightning)
 # =============================================================================
 
 class FCEmbedding(nn.Module):
@@ -68,12 +66,7 @@ class ConvEmbedding(nn.Module):
 class UNetDenseEmbedding(nn.Module):
     """
     U-Net encoder-decoder that produces dense per-pixel embeddings.
-    
     Output shape: (B, embedding_dim, H, W)
-    
-    This replaces the final classification head of a standard U-Net with
-    a feature output layer. The per-pixel embeddings are what θ (the 
-    Bayesian prediction head) operates on.
     """
     def __init__(self, n_channels: int = 1, embedding_dim: int = 32, bilinear: bool = False):
         super().__init__()
@@ -91,16 +84,9 @@ class UNetDenseEmbedding(nn.Module):
         self.up2 = Up(512, 256 // factor, bilinear)
         self.up3 = Up(256, 128 // factor, bilinear)
         self.up4 = Up(128, 64, bilinear)
-        # Final layer outputs embedding_dim channels instead of n_classes
         self.out_conv = nn.Conv2d(64, embedding_dim, kernel_size=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: (B, C, H, W) input images
-        Returns:
-            embeddings: (B, embedding_dim, H, W) dense per-pixel embeddings
-        """
         x1 = self.inc(x)
         x2 = self.down1(x1)
         x3 = self.down2(x2)
@@ -115,14 +101,11 @@ class UNetDenseEmbedding(nn.Module):
 
 
 # =============================================================================
-# 3. Prediction Heads
+# 3. Prediction Heads (unchanged)
 # =============================================================================
 
 class PredictionHead(nn.Module):
-    """
-    Linear prediction head for non-segmentation tasks.
-    f_θ(g(x)) = θ^T g(x) + bias
-    """
+    """Linear prediction head for non-segmentation tasks."""
     def __init__(self, embedding_dim: int, output_dim: int):
         super().__init__()
         self.embedding_dim = embedding_dim
@@ -130,15 +113,7 @@ class PredictionHead(nn.Module):
         self.num_params = embedding_dim * output_dim + output_dim
 
     def forward(self, embeddings: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            embeddings: (batch, embedding_dim)
-            theta: (num_params,) or (num_samples, num_params)
-        Returns:
-            predictions: (batch, output_dim) or (num_samples, batch, output_dim)
-        """
         w_size = self.embedding_dim * self.output_dim
-
         if theta.dim() == 1:
             W = theta[:w_size].view(self.embedding_dim, self.output_dim)
             b = theta[w_size:]
@@ -152,89 +127,39 @@ class PredictionHead(nn.Module):
 
 
 class SegmentationPredictionHead(nn.Module):
-    """
-    Per-pixel linear prediction head for segmentation.
-    
-    Equivalent to a 1×1 convolution: for each pixel, applies the same
-    linear transformation θ to the embedding_dim-dimensional feature vector
-    to produce num_classes logits.
-    
-    θ consists of:
-        - Weight: (embedding_dim, num_classes)  
-        - Bias: (num_classes,)
-    Total params = embedding_dim * num_classes + num_classes
-    
-    This is the layer whose weights are treated as random variables
-    in the Bayesian framework. The same θ is shared across all pixels,
-    which is what makes this tractable — θ is small even though the
-    output is spatially dense.
-    """
+    """Per-pixel linear prediction head for segmentation (1x1 conv)."""
     def __init__(self, embedding_dim: int, num_classes: int):
         super().__init__()
         self.embedding_dim = embedding_dim
         self.num_classes = num_classes
         self.num_params = embedding_dim * num_classes + num_classes
 
-    def forward(
-        self, 
-        embeddings: torch.Tensor, 
-        theta: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Args:
-            embeddings: (B, embedding_dim, H, W) dense per-pixel embeddings
-            theta: (num_params,) single parameter vector
-                   or (S, num_params) multiple samples
-        
-        Returns:
-            If theta is 1D: (B, num_classes, H, W) logits
-            If theta is 2D: (S, B, num_classes, H, W) logits
-        """
+    def forward(self, embeddings: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
         w_size = self.embedding_dim * self.num_classes
-
         if theta.dim() == 1:
-            # Single theta — equivalent to 1×1 conv
             W = theta[:w_size].view(self.num_classes, self.embedding_dim, 1, 1)
             b = theta[w_size:].view(self.num_classes)
-            # F.conv2d: weight shape (out_channels, in_channels, kH, kW)
             return F.conv2d(embeddings, W, b)
-        
         elif theta.dim() == 2:
-            # Multiple theta samples: (S, num_params)
             S = theta.size(0)
             B, D, H, W_spatial = embeddings.shape
-
             W = theta[:, :w_size].view(S, self.num_classes, self.embedding_dim)
             b = theta[:, w_size:].view(S, self.num_classes)
-
-            # Reshape embeddings: (B, D, H, W) -> (B, D, H*W) -> (B, H*W, D)
-            emb_flat = embeddings.view(B, D, -1).permute(0, 2, 1)  # (B, HW, D)
-            
-            # For each sample s, compute emb_flat @ W[s].T + b[s]
-            # W[s]: (num_classes, D) -> W[s].T: (D, num_classes)
-            # Result per sample: (B, HW, num_classes)
+            emb_flat = embeddings.view(B, D, -1).permute(0, 2, 1)
             results = []
             for s in range(S):
-                logits_flat = emb_flat @ W[s].T + b[s]  # (B, HW, num_classes)
+                logits_flat = emb_flat @ W[s].T + b[s]
                 logits = logits_flat.permute(0, 2, 1).view(B, self.num_classes, H, W_spatial)
                 results.append(logits)
-            
-            return torch.stack(results, dim=0)  # (S, B, num_classes, H, W)
+            return torch.stack(results, dim=0)
 
 
 # =============================================================================
-# 4. Inference Network h_γ
+# 4. Inference Network h_γ (unchanged)
 # =============================================================================
 
 class InferenceNetwork(nn.Module):
-    """
-    Amortized inference network h_γ.
-    Takes concatenated [g_bar(x_{1:n}), g(x*)] and outputs
-    variational parameters φ = (μ, log_σ) of q_φ(θ | x_{1:n}, x*).
-    
-    For segmentation, both train_summary and test_summary are global
-    vectors obtained by spatially averaging the dense embeddings.
-    """
+    """Amortized inference network h_γ."""
     def __init__(
         self,
         embedding_dim: int,
@@ -243,7 +168,6 @@ class InferenceNetwork(nn.Module):
     ):
         super().__init__()
         input_dim = 2 * embedding_dim
-
         if hidden_dims is None:
             d = theta_dim
             hidden_dims = [64 * d, 32 * d, 16 * d, 8 * d, 4 * d]
@@ -261,15 +185,6 @@ class InferenceNetwork(nn.Module):
     def forward(
         self, train_summary: torch.Tensor, test_embedding: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            train_summary: (embedding_dim,) aggregated training embedding
-            test_embedding: (M, embedding_dim) or (embedding_dim,) test embeddings
-
-        Returns:
-            mu: (M, theta_dim) or (theta_dim,)
-            log_sigma: (M, theta_dim) or (theta_dim,)
-        """
         if test_embedding.dim() == 1:
             test_embedding = test_embedding.unsqueeze(0)
             squeeze = True
@@ -289,22 +204,15 @@ class InferenceNetwork(nn.Module):
         if squeeze:
             mu = mu.squeeze(0)
             log_sigma = log_sigma.squeeze(0)
-
         return mu, log_sigma
 
 
 # =============================================================================
-# 5. Adaptive Prior (Energy-based prior)
+# 5. Adaptive Prior (unchanged)
 # =============================================================================
 
 class AdaptivePrior(nn.Module):
-    """
-    Energy-based adaptive prior p(θ | x_{1:N}, x*).
-    
-    For segmentation (pixel-wise classification):
-    E(θ; x_{1:N}, x*) = Σ_i Σ_pixel Σ_class log p(y_pixel=class | x_i, θ)
-                       + Σ_pixel Σ_class log p(y_pixel=class | x*, θ)
-    """
+    """Energy-based adaptive prior p(θ | x_{1:N}, x*)."""
     def __init__(
         self,
         task: str = "classification",
@@ -321,11 +229,7 @@ class AdaptivePrior(nn.Module):
         self.y_min = y_min
         self.y_max = y_max
 
-    def compute_energy(
-        self,
-        train_logits: torch.Tensor,
-        test_logits: torch.Tensor,
-    ) -> torch.Tensor:
+    def compute_energy(self, train_logits, test_logits):
         if self.task == "classification":
             return self._energy_classification(train_logits, test_logits)
         elif self.task == "segmentation":
@@ -333,194 +237,92 @@ class AdaptivePrior(nn.Module):
         else:
             return self._energy_regression(train_logits, test_logits)
 
-    def _energy_classification(
-        self, train_logits: torch.Tensor, test_logits: torch.Tensor
-    ) -> torch.Tensor:
+    def _energy_classification(self, train_logits, test_logits):
         train_log_probs = F.log_softmax(train_logits, dim=-1)
         train_energy = train_log_probs.sum()
-
         if test_logits.dim() == 1:
             test_logits = test_logits.unsqueeze(0)
         test_log_probs = F.log_softmax(test_logits, dim=-1)
         test_energy = test_log_probs.sum()
-
         return train_energy + test_energy
 
-    def _energy_segmentation(
-        self, train_logits: torch.Tensor, test_logits: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Segmentation energy: sum of per-pixel classification energies.
-        
-        Args:
-            train_logits: (N, C, H, W) or (B, N, C, H, W)
-            test_logits: (B, C, H, W) or (C, H, W)
-        """
-        # log softmax over classes dimension (dim=1 for NCHW)
+    def _energy_segmentation(self, train_logits, test_logits):
         if train_logits.dim() == 4:
-            train_log_probs = F.log_softmax(train_logits, dim=1)  # (N, C, H, W)
+            train_log_probs = F.log_softmax(train_logits, dim=1)
         else:
             train_log_probs = F.log_softmax(train_logits, dim=-3)
         train_energy = train_log_probs.sum()
-
         if test_logits.dim() == 3:
             test_logits = test_logits.unsqueeze(0)
         test_log_probs = F.log_softmax(test_logits, dim=1)
         test_energy = test_log_probs.sum()
-
         return train_energy + test_energy
 
-    def _energy_regression(
-        self, train_preds: torch.Tensor, test_preds: torch.Tensor
-    ) -> torch.Tensor:
-        y_samples = torch.linspace(
-            self.y_min, self.y_max, self.mc_samples, device=train_preds.device
-        )
+    def _energy_regression(self, train_preds, test_preds):
+        y_samples = torch.linspace(self.y_min, self.y_max, self.mc_samples, device=train_preds.device)
         train_mu = train_preds.squeeze(-1)
         diff_train = y_samples.unsqueeze(1) - train_mu.unsqueeze(0)
         log_lik_train = -0.5 * diff_train**2 - 0.5 * math.log(2 * math.pi)
         scale = (self.y_max - self.y_min) / self.mc_samples
         train_energy = (log_lik_train.sum(dim=1) * scale).sum()
-
         if test_preds.dim() == 1:
             test_preds = test_preds.unsqueeze(0)
         test_mu = test_preds.squeeze(-1)
         diff_test = y_samples.unsqueeze(1) - test_mu.unsqueeze(0)
         log_lik_test = -0.5 * diff_test**2 - 0.5 * math.log(2 * math.pi)
         test_energy = (log_lik_test.sum(dim=1) * scale).sum()
-
         return train_energy + test_energy
 
-    def log_prior(
-        self,
-        train_logits: torch.Tensor,
-        test_logits: torch.Tensor,
-    ) -> torch.Tensor:
+    def log_prior(self, train_logits, test_logits):
         return self.compute_energy(train_logits, test_logits)
 
 
 # =============================================================================
-# 6. ELBO Computation
+# 6. ELBO Computation (unchanged)
 # =============================================================================
 
 class ELBOComputer(nn.Module):
-    """
-    Computes the ELBO objective.
-    
-    For segmentation, the log-likelihood is the sum of per-pixel
-    cross-entropy losses across all spatial locations.
-    """
-    def __init__(
-        self,
-        task: str = "classification",
-        kl_weight: float = 1.0,
-        num_classes: int = 2,
-    ):
+    """Computes the ELBO objective."""
+    def __init__(self, task: str = "classification", kl_weight: float = 1.0, num_classes: int = 2):
         super().__init__()
         self.task = task
         self.kl_weight = kl_weight
         self.num_classes = num_classes
-        self.prior = AdaptivePrior(
-            task=task,
-            num_classes=num_classes,
-        )
+        self.prior = AdaptivePrior(task=task, num_classes=num_classes)
 
-    def forward(
-        self,
-        train_x_emb: torch.Tensor,
-        train_y: torch.Tensor,
-        test_x_emb: torch.Tensor,
-        theta: torch.Tensor,
-        mu: torch.Tensor,
-        log_sigma: torch.Tensor,
-        prediction_head,
-    ) -> torch.Tensor:
-        """
-        Args:
-            For non-segmentation:
-                train_x_emb: (N, d) embedded training covariates
-                train_y: (N,) training labels
-                test_x_emb: (d,) embedded test covariate
-            For segmentation:
-                train_x_emb: (N, d, H, W) dense training embeddings
-                train_y: (N, H, W) training segmentation masks
-                test_x_emb: (1, d, H, W) dense test embeddings
-            theta: (theta_dim,) sampled parameters
-            mu: (theta_dim,) variational mean
-            log_sigma: (theta_dim,) variational log std
-            prediction_head: the prediction head module
-
-        Returns:
-            elbo: scalar
-        """
+    def forward(self, train_x_emb, train_y, test_x_emb, theta, mu, log_sigma, prediction_head):
         if self.task == "segmentation":
             return self._forward_segmentation(
-                train_x_emb, train_y, test_x_emb,
-                theta, mu, log_sigma, prediction_head
+                train_x_emb, train_y, test_x_emb, theta, mu, log_sigma, prediction_head
             )
         else:
             return self._forward_standard(
-                train_x_emb, train_y, test_x_emb,
-                theta, mu, log_sigma, prediction_head
+                train_x_emb, train_y, test_x_emb, theta, mu, log_sigma, prediction_head
             )
 
-    def _forward_standard(
-        self, train_x_emb, train_y, test_x_emb,
-        theta, mu, log_sigma, prediction_head
-    ):
-        # 1. Log-likelihood
+    def _forward_standard(self, train_x_emb, train_y, test_x_emb, theta, mu, log_sigma, prediction_head):
         train_preds = prediction_head(train_x_emb, theta)
         log_lik = self._log_likelihood(train_preds, train_y)
-
-        # 2. Log prior
         test_preds = prediction_head(
-            test_x_emb.unsqueeze(0) if test_x_emb.dim() == 1 else test_x_emb,
-            theta,
+            test_x_emb.unsqueeze(0) if test_x_emb.dim() == 1 else test_x_emb, theta,
         )
         log_prior = self.prior.log_prior(train_preds, test_preds)
-
-        # 3. Log q
         sigma = torch.exp(log_sigma)
         log_q_sample = torch.sum(
-            -0.5 * ((theta - mu) / sigma) ** 2
-            - log_sigma
-            - 0.5 * math.log(2 * math.pi)
+            -0.5 * ((theta - mu) / sigma) ** 2 - log_sigma - 0.5 * math.log(2 * math.pi)
         )
+        return log_lik + self.kl_weight * (log_prior - log_q_sample)
 
-        elbo = log_lik + self.kl_weight * (log_prior - log_q_sample)
-        return elbo
-
-    def _forward_segmentation(
-        self, train_x_emb, train_y, test_x_emb,
-        theta, mu, log_sigma, prediction_head
-    ):
-        """
-        Segmentation-specific ELBO.
-        
-        Args:
-            train_x_emb: (N, d, H, W)
-            train_y: (N, H, W) with integer class labels
-            test_x_emb: (1, d, H, W)
-            theta: (theta_dim,)
-        """
-        # 1. Log-likelihood: per-pixel cross-entropy summed over all pixels and images
-        train_logits = prediction_head(train_x_emb, theta)  # (N, C, H, W)
+    def _forward_segmentation(self, train_x_emb, train_y, test_x_emb, theta, mu, log_sigma, prediction_head):
+        train_logits = prediction_head(train_x_emb, theta)
         log_lik = self._log_likelihood_segmentation(train_logits, train_y)
-
-        # 2. Log prior (energy-based)
-        test_logits = prediction_head(test_x_emb, theta)  # (1, C, H, W)
+        test_logits = prediction_head(test_x_emb, theta)
         log_prior = self.prior.log_prior(train_logits, test_logits)
-
-        # 3. Log q
         sigma = torch.exp(log_sigma)
         log_q_sample = torch.sum(
-            -0.5 * ((theta - mu) / sigma) ** 2
-            - log_sigma
-            - 0.5 * math.log(2 * math.pi)
+            -0.5 * ((theta - mu) / sigma) ** 2 - log_sigma - 0.5 * math.log(2 * math.pi)
         )
-
-        elbo = log_lik + self.kl_weight * (log_prior - log_q_sample)
-        return elbo
+        return log_lik + self.kl_weight * (log_prior - log_q_sample)
 
     def _log_likelihood(self, preds, targets):
         if self.task == "classification":
@@ -529,32 +331,16 @@ class ELBOComputer(nn.Module):
             return -0.5 * torch.sum((preds - targets) ** 2)
 
     def _log_likelihood_segmentation(self, logits, targets):
-        """
-        Per-pixel cross-entropy, summed over all pixels and images.
-        
-        Args:
-            logits: (N, C, H, W)
-            targets: (N, H, W) long tensor
-        """
         return -F.cross_entropy(logits, targets.long(), reduction="sum")
 
 
 # =============================================================================
-# 7. Synthetic Environment Generator
+# 7. Synthetic Environment Generator (unchanged)
 # =============================================================================
 
 class SyntheticEnvironmentGenerator:
-    """
-    Generates synthetic environments by bootstrap subsampling.
-    Works for both tabular and image segmentation data.
-    """
-    def __init__(
-        self,
-        train_x: torch.Tensor,
-        train_y: torch.Tensor,
-        n_train: int,
-        n_test: int,
-    ):
+    """Generates synthetic environments by bootstrap subsampling."""
+    def __init__(self, train_x, train_y, n_train, n_test):
         self.train_x = train_x
         self.train_y = train_y
         self.N = train_x.size(0)
@@ -573,17 +359,18 @@ class SyntheticEnvironmentGenerator:
 
 
 # =============================================================================
-# 8. VIDS Model (Main class — supports all tasks)
+# 8. VIDS Lightning Module
 # =============================================================================
 
-class VIDS(nn.Module):
+class VIDS(L.LightningModule):
     """
     Variational Inference under Distribution Shifts (VIDS).
+    PyTorch Lightning implementation.
     
-    Supports:
-    - 'classification': standard image/tabular classification
-    - 'regression': tabular regression
-    - 'segmentation': dense pixel-wise classification (U-Net based)
+    Supports: 'classification', 'regression', 'segmentation'
+    
+    Only the inference network is trained; the embedding network is frozen.
+    Logging only happens during VIDS training (not during pre-training).
     """
 
     def __init__(
@@ -596,37 +383,37 @@ class VIDS(nn.Module):
         kl_weight: float = 0.005,
         variance_penalty: float = 0.001,
         num_classes: int = 2,
+        # Training hyperparameters
+        learning_rate: float = 1e-3,
+        num_environments: int = 10,
+        env_train_size: int = 500,
+        env_test_size: int = 20,
+        # Prediction hyperparameters
+        num_prediction_samples: int = 100,
     ):
-        """
-        Args:
-            embedding_net: pre-trained embedding network g_ξ
-                For segmentation: should be UNetDenseEmbedding producing (B, embedding_dim, H, W)
-                For others: produces (B, embedding_dim)
-            embedding_dim: dimension of embeddings
-            output_dim: number of output classes (classification/segmentation) or 1 (regression)
-            task: 'classification', 'regression', or 'segmentation'
-            inference_hidden_dims: hidden layer sizes for h_γ
-            kl_weight: weight λ for KL term
-            variance_penalty: τ for cross-environment variance penalty
-            num_classes: number of classes
-        """
         super().__init__()
+        self.save_hyperparameters(ignore=["embedding_net"])
 
         self.embedding_net = embedding_net
         self.embedding_dim = embedding_dim
         self.output_dim = output_dim
         self.task = task
         self.variance_penalty = variance_penalty
+        self.lr = learning_rate
+        self.num_environments = num_environments
+        self.env_train_size = env_train_size
+        self.env_test_size = env_test_size
+        self.num_prediction_samples = num_prediction_samples
 
         # Choose appropriate prediction head
         if task == "segmentation":
             self.prediction_head = SegmentationPredictionHead(embedding_dim, output_dim)
         else:
             self.prediction_head = PredictionHead(embedding_dim, output_dim)
-        
+
         theta_dim = self.prediction_head.num_params
 
-        # Inference network
+        # Inference network (the only trainable part)
         self.inference_net = InferenceNetwork(
             embedding_dim=embedding_dim,
             theta_dim=theta_dim,
@@ -644,40 +431,31 @@ class VIDS(nn.Module):
         for param in self.embedding_net.parameters():
             param.requires_grad = False
 
+        # Freeze prediction head (its params are not directly optimized;
+        # θ is sampled via the inference network)
+        for param in self.prediction_head.parameters():
+            param.requires_grad = False
+
+    # -----------------------------------------------------------------
+    # Embedding helpers
+    # -----------------------------------------------------------------
+
     @torch.no_grad()
     def compute_embeddings(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Compute embeddings using the frozen pre-trained network.
-        
-        For segmentation: returns (B, embedding_dim, H, W)
-        For others: returns (B, embedding_dim)
-        """
+        """Compute embeddings using the frozen pre-trained network."""
         self.embedding_net.eval()
         return self.embedding_net(x)
 
     def aggregate_embeddings(self, embeddings: torch.Tensor) -> torch.Tensor:
-        """
-        Aggregate embeddings into a single summary vector.
-        
-        For segmentation (B, D, H, W): global average pool over spatial dims,
-            then average over batch -> (D,)
-        For tabular/image classification (B, D): average over batch -> (D,)
-        """
+        """Aggregate embeddings into a single summary vector."""
         if self.task == "segmentation":
-            # Global average pool: (B, D, H, W) -> (B, D)
             pooled = embeddings.mean(dim=(2, 3))
-            # Average over batch: (B, D) -> (D,)
             return pooled.mean(dim=0)
         else:
             return embeddings.mean(dim=0)
 
     def aggregate_single_image_embedding(self, embedding: torch.Tensor) -> torch.Tensor:
-        """
-        For segmentation: spatially pool a single image's dense embedding 
-        to get a global vector for the inference network.
-        
-        (D, H, W) -> (D,)  or  (1, D, H, W) -> (D,)
-        """
+        """Spatially pool a single image's dense embedding to a global vector."""
         if embedding.dim() == 4:
             return embedding.mean(dim=(0, 2, 3))
         elif embedding.dim() == 3:
@@ -691,42 +469,41 @@ class VIDS(nn.Module):
         eps = torch.randn_like(sigma)
         return mu + sigma * eps
 
+    # -----------------------------------------------------------------
+    # Core forward / loss computation
+    # -----------------------------------------------------------------
+
+    def forward(self, train_x: torch.Tensor, test_x: torch.Tensor, num_samples: Optional[int] = None):
+        """
+        Inference forward pass — calls predict internally.
+        Useful for Lightning's predict step and manual inference.
+        """
+        if num_samples is None:
+            num_samples = self.num_prediction_samples
+        return self.predict_with_uncertainty(train_x, test_x, num_samples)
+
     def compute_environment_elbo(
         self,
         env_train_x: torch.Tensor,
         env_train_y: torch.Tensor,
         env_test_x: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Compute ELBO for a single synthetic environment.
-        """
-        # Compute embeddings
+        """Compute ELBO for a single synthetic environment."""
         train_emb = self.compute_embeddings(env_train_x)
         test_emb = self.compute_embeddings(env_test_x)
-
-        # Aggregate training embeddings into summary vector
         train_summary = self.aggregate_embeddings(train_emb)
 
         total_elbo = torch.tensor(0.0, device=env_train_x.device)
 
         if self.task == "segmentation":
-            # For segmentation, iterate over test images
             for j in range(env_test_x.size(0)):
-                test_emb_j = test_emb[j:j+1]  # (1, D, H, W) — keep batch dim
-                
-                # Pool to get global vector for inference network
+                test_emb_j = test_emb[j:j+1]
                 test_summary_j = self.aggregate_single_image_embedding(test_emb_j)
-                
-                # Get variational parameters
                 mu, log_sigma = self.inference_net(train_summary, test_summary_j)
-                
-                # Sample θ
                 theta = self.sample_theta(mu, log_sigma)
-                
-                # Compute ELBO
                 elbo_j = self.elbo_computer(
                     train_x_emb=train_emb,
-                    train_y=env_train_y if env_train_y.dim() > 1 else env_train_y,
+                    train_y=env_train_y,
                     test_x_emb=test_emb_j,
                     theta=theta,
                     mu=mu,
@@ -735,7 +512,6 @@ class VIDS(nn.Module):
                 )
                 total_elbo = total_elbo + elbo_j
         else:
-            # Original non-segmentation path
             for j in range(env_test_x.size(0)):
                 test_emb_j = test_emb[j]
                 mu, log_sigma = self.inference_net(train_summary, test_emb_j)
@@ -753,36 +529,6 @@ class VIDS(nn.Module):
 
         return total_elbo
 
-    # def compute_loss(
-    #     self,
-    #     train_x: torch.Tensor,
-    #     train_y: torch.Tensor,
-    #     num_environments: int,
-    #     env_train_size: int,
-    #     env_test_size: int,
-    # ) -> torch.Tensor:
-    #     """
-    #     Compute full VIDS training loss with cross-environment variance penalty.
-    #     """
-    #     env_generator = SyntheticEnvironmentGenerator(
-    #         train_x, train_y, env_train_size, env_test_size
-    #     )
-
-    #     env_elbos = []
-    #     for _ in range(num_environments):
-    #         env_train_x, env_train_y, env_test_x, env_test_y = (
-    #             env_generator.sample_environment()
-    #         )
-    #         elbo = self.compute_environment_elbo(
-    #             env_train_x, env_train_y, env_test_x
-    #         )
-    #         env_elbos.append(elbo)
-
-    #     env_elbos = torch.stack(env_elbos)
-    #     mean_elbo = env_elbos.mean()
-    #     var_penalty = env_elbos.var() if num_environments > 1 else torch.tensor(0.0)
-    #     loss = -mean_elbo + self.variance_penalty * var_penalty
-    #     return loss
     def compute_loss(
         self,
         train_x: torch.Tensor,
@@ -790,22 +536,19 @@ class VIDS(nn.Module):
         num_environments: int,
         env_train_size: int,
         env_test_size: int,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Compute full VIDS training loss. 
-        Args:
-            train_x: Batch of inputs (B, C, H, W) or (B, D)
-            train_y: Batch of targets
-            ...
+        Compute full VIDS training loss.
+        
+        Returns:
+            loss: scalar total loss
+            mean_elbo: scalar mean ELBO across environments
+            var_penalty: scalar variance penalty
         """
         batch_size = train_x.size(0)
-        
-        # Ensure batch is large enough for the requested test split
-        # (Bootstrap sampling allows train_size > batch_size, but test samples must exist)
+
         if batch_size < env_test_size:
-            # Fallback: if batch is tiny, use half for test
             real_test_size = max(1, batch_size // 2)
-            # Adjust train size roughly to fit
             real_train_size = max(1, batch_size - real_test_size)
         else:
             real_test_size = env_test_size
@@ -827,12 +570,110 @@ class VIDS(nn.Module):
 
         env_elbos = torch.stack(env_elbos)
         mean_elbo = env_elbos.mean()
-        var_penalty = env_elbos.var() if num_environments > 1 else torch.tensor(0.0)
+        var_penalty = env_elbos.var() if num_environments > 1 else torch.tensor(0.0, device=train_x.device)
         loss = -mean_elbo + self.variance_penalty * var_penalty
+        return loss, mean_elbo, var_penalty
+
+    # -----------------------------------------------------------------
+    # Lightning training / validation steps
+    # -----------------------------------------------------------------
+
+    def training_step(self, batch, batch_idx):
+        x, y = batch
+
+        loss, mean_elbo, var_penalty = self.compute_loss(
+            train_x=x,
+            train_y=y,
+            num_environments=self.num_environments,
+            env_train_size=self.env_train_size,
+            env_test_size=self.env_test_size,
+        )
+
+        # Logging
+        self.log("train_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
+        self.log("train_mean_elbo", mean_elbo, on_step=False, on_epoch=True)
+        self.log("train_var_penalty", var_penalty, on_step=False, on_epoch=True)
+
         return loss
 
+    def validation_step(self, batch, batch_idx):
+        x, y = batch
+
+        loss, mean_elbo, var_penalty = self.compute_loss(
+            train_x=x,
+            train_y=y,
+            num_environments=self.num_environments,
+            env_train_size=self.env_train_size,
+            env_test_size=self.env_test_size,
+        )
+
+        self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
+        self.log("val_mean_elbo", mean_elbo, on_step=False, on_epoch=True)
+        self.log("val_var_penalty", var_penalty, on_step=False, on_epoch=True)
+
+        # Log images for first batch
+        if batch_idx == 0 and self.task == "segmentation":
+            self._log_segmentation_images(batch, stage="val")
+
+        return loss
+
+    # -----------------------------------------------------------------
+    # Image logging
+    # -----------------------------------------------------------------
+
+    def _create_overlay_image(self, image, mask, alpha=0.5):
+        """Create an RGB overlay of a mask on a grayscale/RGB image."""
+        if image.shape[0] == 1:
+            image_rgb = image.repeat(3, 1, 1)
+        else:
+            image_rgb = image.clone()
+
+        if image_rgb.max() > 1.0:
+            image_rgb = image_rgb / 255.0
+
+        colored_mask = torch.zeros(3, mask.shape[0], mask.shape[1], device=mask.device)
+        colored_mask[0][mask == 1] = 1.0  # Red for class 1
+
+        overlay = (1 - alpha) * image_rgb + alpha * colored_mask
+        overlay = torch.clamp(overlay, 0, 1)
+        return overlay
+
     @torch.no_grad()
-    def predict(
+    def _log_segmentation_images(self, batch, stage="val"):
+        """Log input / ground truth / predicted mask overlays."""
+        if not self.logger:
+            return
+
+        x, y = batch
+        # Use the batch itself as 'training context' for prediction
+        results = self.predict_with_uncertainty(
+            train_x=x, test_x=x[:1], num_samples=min(20, self.num_prediction_samples)
+        )
+
+        img = x[0].cpu()
+        gt_mask = y[0].cpu()
+        pred_mask = results["predicted_masks"][0].cpu()
+
+        gt_overlay = self._create_overlay_image(img, gt_mask)
+        pred_overlay = self._create_overlay_image(img, pred_mask)
+
+        # Normalise uncertainty map to [0, 1] for visualisation
+        unc_map = results["uncertainty_map"][0].cpu()
+        if unc_map.max() > 0:
+            unc_map = unc_map / unc_map.max()
+        unc_image = unc_map.unsqueeze(0).repeat(3, 1, 1)  # grayscale → RGB
+
+        self.logger.experiment.add_image(f"{stage}/input", img, self.current_epoch)
+        self.logger.experiment.add_image(f"{stage}/ground_truth", gt_overlay, self.current_epoch)
+        self.logger.experiment.add_image(f"{stage}/prediction", pred_overlay, self.current_epoch)
+        self.logger.experiment.add_image(f"{stage}/uncertainty", unc_image, self.current_epoch)
+
+    # -----------------------------------------------------------------
+    # Prediction with uncertainty
+    # -----------------------------------------------------------------
+
+    @torch.no_grad()
+    def predict_with_uncertainty(
         self,
         train_x: torch.Tensor,
         test_x: torch.Tensor,
@@ -840,10 +681,9 @@ class VIDS(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         """
         Predict with uncertainty estimation.
-        
-        For segmentation:
-            Returns per-pixel predictions and uncertainty maps.
+        This is the main inference entry point (replaces the old `predict`).
         """
+        was_training = self.training
         self.eval()
 
         train_emb = self.compute_embeddings(train_x)
@@ -851,27 +691,24 @@ class VIDS(nn.Module):
         train_summary = self.aggregate_embeddings(train_emb)
 
         if self.task == "segmentation":
-            return self._predict_segmentation(
-                train_summary, test_emb, num_samples
-            )
+            result = self._predict_segmentation(train_summary, test_emb, num_samples)
         else:
-            return self._predict_standard(
-                train_summary, test_emb, test_x, num_samples
-            )
+            result = self._predict_standard(train_summary, test_emb, test_x, num_samples)
+
+        if was_training:
+            self.train()
+        return result
 
     def _predict_standard(self, train_summary, test_emb, test_x, num_samples):
         M = test_x.size(0)
         all_predictions = []
-
         for j in range(M):
             test_emb_j = test_emb[j]
             mu, log_sigma = self.inference_net(train_summary, test_emb_j)
             sigma = torch.exp(log_sigma)
             eps = torch.randn(num_samples, mu.size(0), device=mu.device)
             theta_samples = mu.unsqueeze(0) + sigma.unsqueeze(0) * eps
-            preds = self.prediction_head(
-                test_emb_j.unsqueeze(0), theta_samples
-            )
+            preds = self.prediction_head(test_emb_j.unsqueeze(0), theta_samples)
             all_predictions.append(preds.squeeze(1))
 
         all_predictions = torch.stack(all_predictions, dim=1)
@@ -896,54 +733,32 @@ class VIDS(nn.Module):
             }
 
     def _predict_segmentation(self, train_summary, test_emb, num_samples):
-        """
-        Segmentation prediction with per-pixel uncertainty.
-        
-        Args:
-            train_summary: (D,) aggregated training summary
-            test_emb: (M, D, H, W) test image embeddings
-            num_samples: number of posterior samples
-        
-        Returns:
-            dict with:
-                'predictions': (M, C, H, W) mean class probabilities
-                'std': (M, C, H, W) standard deviation of probabilities
-                'predicted_masks': (M, H, W) argmax predictions
-                'uncertainty_map': (M, H, W) predictive entropy
-                'samples': (S, M, C, H, W) all probability samples
-        """
         M = test_emb.size(0)
-        all_probs = []  # Will collect (S, 1, C, H, W) for each test image
+        all_probs = []
 
         for j in range(M):
-            test_emb_j = test_emb[j:j+1]  # (1, D, H, W)
+            test_emb_j = test_emb[j:j+1]
             test_summary_j = self.aggregate_single_image_embedding(test_emb_j)
 
             mu, log_sigma = self.inference_net(train_summary, test_summary_j)
             sigma = torch.exp(log_sigma)
             eps = torch.randn(num_samples, mu.size(0), device=mu.device)
-            theta_samples = mu.unsqueeze(0) + sigma.unsqueeze(0) * eps  # (S, theta_dim)
+            theta_samples = mu.unsqueeze(0) + sigma.unsqueeze(0) * eps
 
-            # Compute logits for all samples
-            logits = self.prediction_head(test_emb_j, theta_samples)  # (S, 1, C, H, W)
-            probs = F.softmax(logits, dim=2)  # softmax over classes
-            all_probs.append(probs.squeeze(1))  # (S, C, H, W)
+            logits = self.prediction_head(test_emb_j, theta_samples)
+            probs = F.softmax(logits, dim=2)
+            all_probs.append(probs.squeeze(1))
 
-        # Stack over test images: (S, M, C, H, W)
         all_probs = torch.stack(all_probs, dim=1)
 
-        mean_probs = all_probs.mean(dim=0)  # (M, C, H, W)
-        std_probs = all_probs.std(dim=0)    # (M, C, H, W)
-        predicted_masks = mean_probs.argmax(dim=1)  # (M, H, W)
+        mean_probs = all_probs.mean(dim=0)
+        std_probs = all_probs.std(dim=0)
+        predicted_masks = mean_probs.argmax(dim=1)
 
-        # Predictive entropy: H[p(y|x)] = -Σ_c p_c log p_c
-        entropy = -(mean_probs * torch.log(mean_probs + 1e-10)).sum(dim=1)  # (M, H, W)
-
-        # Mutual information (epistemic uncertainty):
-        # MI = H[E_q[p(y|x,θ)]] - E_q[H[p(y|x,θ)]]
-        per_sample_entropy = -(all_probs * torch.log(all_probs + 1e-10)).sum(dim=2)  # (S, M, H, W)
-        expected_entropy = per_sample_entropy.mean(dim=0)  # (M, H, W) — aleatoric
-        mutual_info = entropy - expected_entropy  # (M, H, W) — epistemic
+        entropy = -(mean_probs * torch.log(mean_probs + 1e-10)).sum(dim=1)
+        per_sample_entropy = -(all_probs * torch.log(all_probs + 1e-10)).sum(dim=2)
+        expected_entropy = per_sample_entropy.mean(dim=0)
+        mutual_info = entropy - expected_entropy
 
         return {
             "predictions": mean_probs,
@@ -955,9 +770,17 @@ class VIDS(nn.Module):
             "samples": all_probs,
         }
 
+    # -----------------------------------------------------------------
+    # Optimizer — only trains the inference network
+    # -----------------------------------------------------------------
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.Adam(self.inference_net.parameters(), lr=self.lr)
+        return optimizer
+
 
 # =============================================================================
-# 9. Pre-training utilities
+# 9. Pre-training utilities (unchanged — run OUTSIDE Lightning)
 # =============================================================================
 
 def pretrain_embedding(
@@ -965,17 +788,8 @@ def pretrain_embedding(
     train_x, train_y,
     task="regression", epochs=100, lr=1e-3, batch_size=64,
 ):
-    """
-    Pre-train the embedding network.
-    
-    For segmentation:
-        embedding_net: UNetDenseEmbedding
-        prediction_head_pretrain: nn.Conv2d(embedding_dim, num_classes, 1)
-        train_x: (N, C, H, W)
-        train_y: (N, H, W) integer masks
-    """
+    """Pre-train the embedding network (no Lightning, no logging)."""
     device = train_x.device
-
     model = nn.Sequential(embedding_net, prediction_head_pretrain).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
@@ -989,9 +803,7 @@ def pretrain_embedding(
         for x_batch, y_batch in loader:
             optimizer.zero_grad()
             preds = model(x_batch)
-            if task == "classification":
-                loss = F.cross_entropy(preds, y_batch.long())
-            elif task == "segmentation":
+            if task in ("classification", "segmentation"):
                 loss = F.cross_entropy(preds, y_batch.long())
             else:
                 loss = F.mse_loss(preds, y_batch)
@@ -1004,11 +816,9 @@ def pretrain_embedding(
             avg_loss = total_loss / n_batches
             print(f"  Pre-train Epoch {epoch+1}/{epochs}, Loss: {avg_loss:.6f}")
 
-    # Final evaluation
     model.eval()
     with torch.no_grad():
         if task == "segmentation":
-            # Compute mean dice or IoU on a small batch
             sample_x = train_x[:min(8, len(train_x))]
             sample_y = train_y[:min(8, len(train_y))]
             sample_preds = model(sample_x)
@@ -1016,19 +826,18 @@ def pretrain_embedding(
             pred_masks = sample_preds.argmax(dim=1)
             accuracy = (pred_masks == sample_y.long()).float().mean()
             print(f"  Final train CE: {sample_loss.item():.6f}, pixel acc: {accuracy.item():.4f}")
+        elif task == "classification":
+            final_preds = model(train_x)
+            final_loss = F.cross_entropy(final_preds, train_y.long())
+            print(f"  Final train CE: {final_loss.item():.6f}")
         else:
             final_preds = model(train_x)
-            if task == "classification":
-                final_loss = F.cross_entropy(final_preds, train_y.long())
-                print(f"  Final train CE: {final_loss.item():.6f}")
-            else:
-                final_mse = F.mse_loss(final_preds, train_y)
-                print(f"  Final train MSE: {final_mse.item():.6f}")
+            final_mse = F.mse_loss(final_preds, train_y)
+            print(f"  Final train MSE: {final_mse.item():.6f}")
 
     embedding_net.eval()
     for param in embedding_net.parameters():
         param.requires_grad = False
-
     return embedding_net, model
 
 
@@ -1042,86 +851,53 @@ def pretrain_segmentation_embedding(
     dice_alpha: float = 0.5,
 ):
     """
-    Convenience function for pre-training the segmentation embedding 
-    with combined CE + Dice loss (matching your original UNet training).
-    
-    Args:
-        embedding_net: UNetDenseEmbedding to pre-train
-        train_x: (N, C, H, W) training images
-        train_y: (N, H, W) segmentation masks
-        num_classes: number of segmentation classes
-        epochs: training epochs
-        lr: learning rate
-        batch_size: batch size
-        class_weights: optional class weights for CE loss
-        dice_alpha: weight for CE vs Dice (alpha * CE + (1-alpha) * Dice)
-    
-    Returns:
-        embedding_net: frozen pre-trained embedding network
-        full_model: the full model (embedding + head) for reference
+    Pre-train segmentation embedding with CE + Dice loss.
+    Runs OUTSIDE Lightning — no logging.
     """
-    # device = train_x.device
-    device = 'cpu'
-    
-    # 1×1 conv head for pre-training
+    device = "cpu"
+
     pretrain_head = nn.Conv2d(
         embedding_net.embedding_dim, num_classes, kernel_size=1
     ).to(device)
-    
+
     model = nn.Sequential(embedding_net, pretrain_head).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    
-    # dataset = torch.utils.data.TensorDataset(train_x, train_y)
-    # loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-    
+
     smooth = 1e-6
-    
+
     model.train()
     for epoch in range(epochs):
-        print('Epoch:', epoch)
+        print("Epoch:", epoch)
         total_loss = 0.0
         total_dice = 0.0
         n_batches = 0
-        
 
         for x_batch, y_batch in loader:
             optimizer.zero_grad()
-            logits = model(x_batch)  # (B, C, H, W)
-            
-            # CE loss
+            logits = model(x_batch)
+
             ce_loss = F.cross_entropy(
-                logits, y_batch.long(), 
-                weight=class_weights, 
-                reduction="mean"
+                logits, y_batch.long(), weight=class_weights, reduction="mean"
             )
-            
-            # Dice loss
+
             pred_soft = torch.softmax(logits, dim=1)
             target_one_hot = F.one_hot(
                 y_batch.long(), num_classes=num_classes
             ).permute(0, 3, 1, 2).float()
-            
+
             intersection = torch.sum(pred_soft * target_one_hot, dim=(2, 3))
             union = torch.sum(pred_soft + target_one_hot, dim=(2, 3))
             dice_score = (2 * intersection + smooth) / (union + smooth)
             dice_loss = 1 - dice_score.mean()
-            
+
             loss = dice_alpha * ce_loss + (1 - dice_alpha) * dice_loss
-            
+
             loss.backward()
             optimizer.step()
-            
+
             total_loss += loss.item()
             total_dice += dice_score.mean().item()
             n_batches += 1
-        
-        # if (epoch + 1) % max(1, epochs // 10) == 0:
-        #     avg_loss = total_loss / n_batches
-        #     avg_dice = total_dice / n_batches
-        #     print(
-        #         f"  Pre-train Epoch {epoch+1}/{epochs}, "
-        #         f"Loss: {avg_loss:.6f}, Dice: {avg_dice:.4f}"
-        #     )
 
         avg_loss = total_loss / n_batches
         avg_dice = total_dice / n_batches
@@ -1129,123 +905,61 @@ def pretrain_segmentation_embedding(
             f"  Pre-train Epoch {epoch+1}/{epochs}, "
             f"Loss: {avg_loss:.6f}, Dice: {avg_dice:.4f}"
         )
-    
-    # Freeze
+
     embedding_net.eval()
     for param in embedding_net.parameters():
         param.requires_grad = False
-    
     return embedding_net, model
 
 
 # =============================================================================
-# 10. Training Loop
+# 10. Example usage with Lightning Trainer
 # =============================================================================
 
-def train_vids(
-    model: VIDS,
-    train_loader: DataLoader,
-    num_environments: int = 10,
-    env_train_size: int = 500,
-    env_test_size: int = 20,
-    num_epochs: int = 10,
-    lr: float = 1e-3,
-    verbose: bool = True,
-) -> List[float]:
+def example_segmentation_lightning():
     """
-    Train the VIDS model using a DataLoader.
-    
-    In each step, the current batch acts as the "universe" of data
-    from which we bootstrap sample 'support' (env_train) and 'query' (env_test) sets.
+    Example showing how to use VIDS with PyTorch Lightning for segmentation.
     """
-    optimizer = torch.optim.Adam(model.inference_net.parameters(), lr=lr)
-    
-    # Automatically detect device from model parameters
-    device = next(model.parameters()).device
-    
-    losses = []
-    model.train()
+    import lightning as L
+    from torch.utils.data import TensorDataset, DataLoader
 
-    total_steps = 0
-    for epoch in range(num_epochs):
-        for batch_idx, (x_batch, y_batch) in enumerate(train_loader):
-            # Move data to device
-            x_batch = x_batch.to(device)
-            y_batch = y_batch.to(device)
-            
-            optimizer.zero_grad()
-
-            # The batch serves as the source population for this step.
-            # We treat the batch size as the available N.
-            # Note: env_train_size is capped by batch size in compute_loss logic
-            # if strictly necessary, but typically bootstrap sampling handles it.
-            loss = model.compute_loss(
-                train_x=x_batch,
-                train_y=y_batch,
-                num_environments=num_environments,
-                env_train_size=env_train_size, 
-                env_test_size=env_test_size,
-            )
-
-            loss.backward()
-            optimizer.step()
-
-            losses.append(loss.item())
-            total_steps += 1
-
-            if verbose and total_steps % 10 == 0:
-                print(f"  Epoch {epoch+1}/{num_epochs} [Batch {batch_idx+1}], Loss: {loss.item():.4f}")
-
-    return losses
-
-
-
-# =============================================================================
-# 11. Usage Example
-# =============================================================================
-
-def example_segmentation():
-    """
-    Example showing how to use VIDS for image segmentation.
-    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
+
     # --- Hyperparameters ---
-    n_channels = 1       # grayscale
-    num_classes = 2       # binary segmentation
-    embedding_dim = 32    # per-pixel embedding dimension
-    H, W = 128, 128      # image size
-    N_train = 50          # number of training images
-    
+    n_channels = 1
+    num_classes = 2
+    embedding_dim = 32
+    H, W = 128, 128
+    N_train = 50
+
     # --- Create dummy data ---
-    train_x = torch.randn(N_train, n_channels, H, W, device=device)
-    train_y = torch.randint(0, num_classes, (N_train, H, W), device=device)
-    
-    # --- Step 1: Create and pre-train embedding network ---
+    train_x = torch.randn(N_train, n_channels, H, W)
+    train_y = torch.randint(0, num_classes, (N_train, H, W))
+
+    train_dataset = TensorDataset(train_x, train_y)
+    train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True)
+    val_loader = DataLoader(train_dataset, batch_size=8, shuffle=False)
+
+    # --- Step 1: Pre-train embedding network (outside Lightning, no logging) ---
     print("Step 1: Pre-training embedding network...")
     embedding_net = UNetDenseEmbedding(
-        n_channels=n_channels, 
-        embedding_dim=embedding_dim, 
-        bilinear=False
-    ).to(device)
-    
-    embedding_net, pretrained_model = pretrain_segmentation_embedding(
-        embedding_net=embedding_net,
-        train_x=train_x,
-        train_y=train_y,
-        num_classes=num_classes,
-        epochs=20,
-        lr=1e-4,
-        batch_size=8,
+        n_channels=n_channels,
+        embedding_dim=embedding_dim,
+        bilinear=False,
     )
-    
-    # --- Step 2: Create VIDS model ---
-    print("\nStep 2: Creating VIDS model...")
-    
-    # For segmentation with small theta, we need small inference network
-    theta_dim = embedding_dim * num_classes + num_classes  # 32*2 + 2 = 66
-    inference_hidden = [256, 128, 64]  # Smaller than default
-    
+
+    embedding_net, _ = pretrain_segmentation_embedding(
+        embedding_net=embedding_net,
+        loader=train_loader,
+        num_classes=num_classes,
+        epochs=5,
+        lr=1e-4,
+    )
+
+    # --- Step 2: Create VIDS Lightning module ---
+    print("\nStep 2: Creating VIDS Lightning model...")
+    inference_hidden = [256, 128, 64]
+
     vids_model = VIDS(
         embedding_net=embedding_net,
         embedding_dim=embedding_dim,
@@ -1255,51 +969,54 @@ def example_segmentation():
         kl_weight=0.001,
         variance_penalty=0.001,
         num_classes=num_classes,
-    ).to(device)
-    
-    print(f"  Prediction head params (θ): {vids_model.prediction_head.num_params}")
-    print(f"  Inference network params: {sum(p.numel() for p in vids_model.inference_net.parameters())}")
-    
-    # --- Step 3: Train VIDS ---
-    print("\nStep 3: Training VIDS inference network...")
-    losses = train_vids(
-        model=vids_model,
-        train_x=train_x,
-        train_y=train_y,
+        learning_rate=1e-3,
         num_environments=3,
-        env_train_size=min(10, N_train),
+        env_train_size=10,
         env_test_size=2,
-        num_steps=20,
-        lr=1e-3,
-        verbose=True,
+        num_prediction_samples=50,
     )
-    
+
+    print(f"  Prediction head params (θ): {vids_model.prediction_head.num_params}")
+    print(
+        f"  Inference network params: "
+        f"{sum(p.numel() for p in vids_model.inference_net.parameters())}"
+    )
+
+    # --- Step 3: Train with Lightning Trainer ---
+    print("\nStep 3: Training VIDS with Lightning Trainer...")
+    trainer = L.Trainer(
+        max_epochs=5,
+        accelerator="auto",
+        log_every_n_steps=1,
+    )
+    trainer.fit(vids_model, train_dataloaders=train_loader, val_dataloaders=val_loader)
+
     # --- Step 4: Predict with uncertainty ---
     print("\nStep 4: Making predictions...")
-    test_x = torch.randn(4, n_channels, H, W, device=device)
-    
-    results = vids_model.predict(
-        train_x=train_x,
-        test_x=test_x,
+    test_x = torch.randn(4, n_channels, H, W)
+    results = vids_model.predict_with_uncertainty(
+        train_x=train_x.to(vids_model.device),
+        test_x=test_x.to(vids_model.device),
         num_samples=50,
     )
-    
+
     print(f"  Predicted masks shape: {results['predicted_masks'].shape}")
     print(f"  Mean probs shape: {results['predictions'].shape}")
     print(f"  Uncertainty map shape: {results['uncertainty_map'].shape}")
     print(f"  Epistemic uncertainty shape: {results['epistemic_uncertainty'].shape}")
     print(f"  Aleatoric uncertainty shape: {results['aleatoric_uncertainty'].shape}")
-    
-    # Per-image summary
+
     for i in range(test_x.size(0)):
-        total_unc = results['uncertainty_map'][i].mean().item()
-        epist = results['epistemic_uncertainty'][i].mean().item()
-        aleat = results['aleatoric_uncertainty'][i].mean().item()
-        print(f"  Image {i}: total_uncertainty={total_unc:.4f}, "
-              f"epistemic={epist:.4f}, aleatoric={aleat:.4f}")
-    
+        total_unc = results["uncertainty_map"][i].mean().item()
+        epist = results["epistemic_uncertainty"][i].mean().item()
+        aleat = results["aleatoric_uncertainty"][i].mean().item()
+        print(
+            f"  Image {i}: total_uncertainty={total_unc:.4f}, "
+            f"epistemic={epist:.4f}, aleatoric={aleat:.4f}"
+        )
+
     return results
 
 
 if __name__ == "__main__":
-    example_segmentation()
+    example_segmentation_lightning()
