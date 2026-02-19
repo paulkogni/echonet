@@ -378,6 +378,43 @@ class PHISeg(L.LightningModule):
         final_recon = self.accumulate_output(s_out_list)
         
         return total_loss, kl_loss, recon_loss, final_recon
+    
+    def sample_softmax(self, x, n_samples=1):
+        """
+        Generates softmax samples from the Prior for a single image.
+
+        Args:
+            x: Input tensor with shape (1, 1, H, W) (Batch size must be 1)
+            n_samples: Number of samples to draw
+
+        Returns:
+            Tensor of shape (n_samples, n_classes, H, W)
+        """
+        # Validation to ensure shape is exactly as you described
+        if x.shape[0] != 1:
+            raise ValueError(f"Expected batch size of 1, got {x.shape[0]}")
+
+        # 1. Repeat the single image `n` times to create a batch
+        # Input: (1, 1, H, W) -> Becomes: (n_samples, 1, H, W)
+        x_repeated = x.repeat(n_samples, 1, 1, 1)
+
+        # 2. Pass through the Prior
+        # training_prior=False tells the model to sample Z stochastically
+        # based solely on the image (not the mask).
+        prior_z, _, _ = self.prior(x_repeated, segm=None, training_prior=False)
+
+        # 3. Decode the Z samples using the Likelihood network
+        s_out_list = self.likelihood(prior_z)
+
+        # 4. Sum the hierarchical levels and apply Softmax
+        # Your accumulate_output function already applies Softmax if use_softmax=True.
+        # It operates on dim=1 (the class dimension).
+        softmax_samples = self.accumulate_output(s_out_list, use_softmax=True)
+
+        # 5. Return
+        # The shape is naturally (n_samples, n_classes, H, W) because
+        # we treated the samples as the batch dimension in step 1.
+        return softmax_samples
 
     def training_step(self, batch, batch_idx):
         loss, kl_loss, recon_loss, pred_soft = self.step(batch)

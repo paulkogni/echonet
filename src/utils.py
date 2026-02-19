@@ -170,7 +170,7 @@ def calculate_volume_from_tracings(frame_df):
 
 
 
-########### traces estimation from mask gere
+########### traces estimation from mask here
 def line_segment_intersection(p1, p2, p3, p4):
     """
     Find intersection point of two line segments if it exists.
@@ -473,3 +473,32 @@ def get_segms_from_traces_filename_ped(file_name, path_to_csv):
 
     return mask_ed, mask_es, frame_ed, frame_es
 
+def calculate_volume_from_mask(binary_mask, num_short_axes=20):
+    """
+    Estimates the LV volume from a binary segmentation mask by first extracting
+    tracings (long axis + short axes) and then applying the Single-Plane
+    Simpson's Method of Disks.
+
+    Parameters
+    ----------
+    binary_mask : numpy.ndarray
+        Binary segmentation mask of the left ventricle with shape (H, W),
+        where non-zero pixels represent the ventricle.
+    num_short_axes : int, optional
+        Number of short-axis chords to sample along the long axis (default: 20).
+
+    Returns
+    -------
+    volume : float
+        Estimated LV volume (in pixel-cubed units).
+    tracings_df : pd.DataFrame
+        The intermediate tracings DataFrame (first row = long axis,
+        subsequent rows = short axes) for inspection / plotting.
+    """
+    # Step 1: Extract tracings (long axis + short axes) from the binary mask
+    tracings_df = extract_lv_axes(binary_mask, num_short_axes=num_short_axes)
+
+    # Step 2: Compute volume from those tracings via Simpson's Method of Disks
+    volume = calculate_volume_from_tracings(tracings_df)
+
+    return volume#, tracings_df

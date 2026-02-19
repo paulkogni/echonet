@@ -854,7 +854,8 @@ def pretrain_segmentation_embedding(
     Pre-train segmentation embedding with CE + Dice loss.
     Runs OUTSIDE Lightning — no logging.
     """
-    device = "cpu"
+    # device = "cpu"
+    device = 'cuda'
 
     pretrain_head = nn.Conv2d(
         embedding_net.embedding_dim, num_classes, kernel_size=1
@@ -873,6 +874,7 @@ def pretrain_segmentation_embedding(
         n_batches = 0
 
         for x_batch, y_batch in loader:
+            x_batch, y_batch = x_batch.to(device), y_batch.to(device)
             optimizer.zero_grad()
             logits = model(x_batch)
 
