@@ -251,11 +251,13 @@ class AdaptivePrior(nn.Module):
             train_log_probs = F.log_softmax(train_logits, dim=1)
         else:
             train_log_probs = F.log_softmax(train_logits, dim=-3)
-        train_energy = train_log_probs.sum()
+        # train_energy = train_log_probs.sum()
+        train_energy = train_log_probs.mean()
         if test_logits.dim() == 3:
             test_logits = test_logits.unsqueeze(0)
         test_log_probs = F.log_softmax(test_logits, dim=1)
-        test_energy = test_log_probs.sum()
+        # test_energy = test_log_probs.sum()
+        test_energy = test_log_probs.mean()
         return train_energy + test_energy
 
     def _energy_regression(self, train_preds, test_preds):
@@ -308,9 +310,12 @@ class ELBOComputer(nn.Module):
         )
         log_prior = self.prior.log_prior(train_preds, test_preds)
         sigma = torch.exp(log_sigma)
-        log_q_sample = torch.sum(
+        log_q_sample = torch.mean(
             -0.5 * ((theta - mu) / sigma) ** 2 - log_sigma - 0.5 * math.log(2 * math.pi)
         )
+        # log_q_sample = torch.sum(
+        #     -0.5 * ((theta - mu) / sigma) ** 2 - log_sigma - 0.5 * math.log(2 * math.pi)
+        # )
         return log_lik + self.kl_weight * (log_prior - log_q_sample)
 
     def _forward_segmentation(self, train_x_emb, train_y, test_x_emb, theta, mu, log_sigma, prediction_head):
@@ -331,7 +336,8 @@ class ELBOComputer(nn.Module):
             return -0.5 * torch.sum((preds - targets) ** 2)
 
     def _log_likelihood_segmentation(self, logits, targets):
-        return -F.cross_entropy(logits, targets.long(), reduction="sum")
+        # return -F.cross_entropy(logits, targets.long(), reduction="sum")
+        return -F.cross_entropy(logits, targets.long(), reduction="mean")
 
 
 # =============================================================================
