@@ -246,18 +246,29 @@ class AdaptivePrior(nn.Module):
         test_energy = test_log_probs.sum()
         return train_energy + test_energy
 
+    # def _energy_segmentation(self, train_logits, test_logits):
+    #     if train_logits.dim() == 4:
+    #         train_log_probs = F.log_softmax(train_logits, dim=1)
+    #     else:
+    #         train_log_probs = F.log_softmax(train_logits, dim=-3)
+    #     # train_energy = train_log_probs.sum()
+    #     train_energy = train_log_probs.mean()
+    #     if test_logits.dim() == 3:
+    #         test_logits = test_logits.unsqueeze(0)
+    #     test_log_probs = F.log_softmax(test_logits, dim=1)
+    #     test_energy = test_log_probs.sum()
+    #     # test_energy = test_log_probs.mean()
+    #     return train_energy + test_energy
     def _energy_segmentation(self, train_logits, test_logits):
-        if train_logits.dim() == 4:
-            train_log_probs = F.log_softmax(train_logits, dim=1)
-        else:
-            train_log_probs = F.log_softmax(train_logits, dim=-3)
-        # train_energy = train_log_probs.sum()
-        train_energy = train_log_probs.mean()
-        if test_logits.dim() == 3:
-            test_logits = test_logits.unsqueeze(0)
+        # Per Eq. 4: integrate over y, sum over data points
+        # For binary seg: sum over classes, MEAN over pixels, then sum over images
+        train_log_probs = F.log_softmax(train_logits, dim=1)  # (B, C, H, W)
+        # Sum over classes (the integral over y), mean over pixels, sum over batch
+        train_energy = train_log_probs.sum(dim=1).mean(dim=(1, 2)).sum()
+        
         test_log_probs = F.log_softmax(test_logits, dim=1)
-        # test_energy = test_log_probs.sum()
-        test_energy = test_log_probs.mean()
+        test_energy = test_log_probs.sum(dim=1).mean(dim=(1, 2)).sum()
+        
         return train_energy + test_energy
 
     def _energy_regression(self, train_preds, test_preds):
@@ -280,7 +291,7 @@ class AdaptivePrior(nn.Module):
 
 
 # =============================================================================
-# 6. ELBO Computation (unchanged)
+# 6. ELBO Computation 
 # =============================================================================
 
 class ELBOComputer(nn.Module):
@@ -310,12 +321,12 @@ class ELBOComputer(nn.Module):
         )
         log_prior = self.prior.log_prior(train_preds, test_preds)
         sigma = torch.exp(log_sigma)
-        log_q_sample = torch.mean(
-            -0.5 * ((theta - mu) / sigma) ** 2 - log_sigma - 0.5 * math.log(2 * math.pi)
-        )
-        # log_q_sample = torch.sum(
+        # log_q_sample = torch.mean(
         #     -0.5 * ((theta - mu) / sigma) ** 2 - log_sigma - 0.5 * math.log(2 * math.pi)
         # )
+        log_q_sample = torch.sum(
+            -0.5 * ((theta - mu) / sigma) ** 2 - log_sigma - 0.5 * math.log(2 * math.pi)
+        )
         return log_lik + self.kl_weight * (log_prior - log_q_sample)
 
     def _forward_segmentation(self, train_x_emb, train_y, test_x_emb, theta, mu, log_sigma, prediction_head):
@@ -336,8 +347,14 @@ class ELBOComputer(nn.Module):
             return -0.5 * torch.sum((preds - targets) ** 2)
 
     def _log_likelihood_segmentation(self, logits, targets):
-        # return -F.cross_entropy(logits, targets.long(), reduction="sum")
-        return -F.cross_entropy(logits, targets.long(), reduction="mean")
+        criterion = torch.nn.CrossEntropyLoss(reduction='none')
+        batch_size = logits.shape[0]
+        logits_flat = logits.view(batch_size, self.num_classes, -1)
+        targets_flat = targets.view(batch_size, -1).long()
+        # return -F.cross_entropy(logits, targets.long(), reduction="mean")
+        return torch.mean(
+            torch.sum(criterion(target=targets_flat, input=logits_flat), dim=1)
+        )
 
 
 # =============================================================================
@@ -396,6 +413,7 @@ class VIDS(L.LightningModule):
         env_test_size: int = 20,
         # Prediction hyperparameters
         num_prediction_samples: int = 100,
+        summary_stats = 'mean_std'
     ):
         super().__init__()
         self.save_hyperparameters(ignore=["embedding_net"])
@@ -410,6 +428,15 @@ class VIDS(L.LightningModule):
         self.env_train_size = env_train_size
         self.env_test_size = env_test_size
         self.num_prediction_samples = num_prediction_samples
+        self.summary_stats = summary_stats
+        
+
+        # code for summary dim if we want richer summary statistics
+        if task == "segmentation" and summary_stats == "mean_std":
+            self.summary_dim = 2 * embedding_dim  # mean + std
+        else:
+            self.summary_dim = embedding_dim
+
 
         # Choose appropriate prediction head
         if task == "segmentation":
@@ -421,7 +448,8 @@ class VIDS(L.LightningModule):
 
         # Inference network (the only trainable part)
         self.inference_net = InferenceNetwork(
-            embedding_dim=embedding_dim,
+            # embedding_dim=embedding_dim,
+            embedding_dim=self.summary_dim,
             theta_dim=theta_dim,
             hidden_dims=inference_hidden_dims,
         )
@@ -452,21 +480,91 @@ class VIDS(L.LightningModule):
         self.embedding_net.eval()
         return self.embedding_net(x)
 
+    # def aggregate_embeddings(self, embeddings: torch.Tensor) -> torch.Tensor:
+    #     """Aggregate embeddings into a single summary vector."""
+    #     if self.task == "segmentation":
+    #         pooled = embeddings.mean(dim=(2, 3))
+    #         return pooled.mean(dim=0)
+    #     else:
+    #         return embeddings.mean(dim=0)
+
+    # def aggregate_single_image_embedding(self, embedding: torch.Tensor) -> torch.Tensor:
+    #     """Spatially pool a single image's dense embedding to a global vector."""
+    #     if embedding.dim() == 4:
+    #         return embedding.mean(dim=(0, 2, 3))
+    #     elif embedding.dim() == 3:
+    #         return embedding.mean(dim=(1, 2))
+    #     else:
+    #         return embedding
     def aggregate_embeddings(self, embeddings: torch.Tensor) -> torch.Tensor:
-        """Aggregate embeddings into a single summary vector."""
+        """
+        Aggregate a batch of embeddings into a single summary vector.
+
+        For non-segmentation: embeddings is (B, D)
+            mean → (D,)
+
+        For segmentation: embeddings is (B, D, H, W)
+            "mean"     → spatial-pool each image to (B, D), then mean over B → (D,)
+            "mean_std" → spatial-pool each image to (B, D), compute mean
+                         and std over B, concatenate → (2D,)
+        """
         if self.task == "segmentation":
+            # Pool each image spatially: (B, D, H, W) → (B, D)
             pooled = embeddings.mean(dim=(2, 3))
-            return pooled.mean(dim=0)
+            # Aggregate across images in the environment
+            batch_mean = pooled.mean(dim=0)  # (D,)
+
+            if self.summary_stats == "mean_std":
+                if pooled.size(0) > 1:
+                    batch_std = pooled.std(dim=0)  # (D,)
+                else:
+                    batch_std = torch.zeros_like(batch_mean)
+                return torch.cat([batch_mean, batch_std], dim=0)  # (2D,)
+            else:
+                return batch_mean  # (D,)
         else:
-            return embeddings.mean(dim=0)
+            return embeddings.mean(dim=0)  # (D,)
 
     def aggregate_single_image_embedding(self, embedding: torch.Tensor) -> torch.Tensor:
-        """Spatially pool a single image's dense embedding to a global vector."""
+        """
+        Spatially pool a single test image's dense embedding to a summary vector.
+
+        Input shapes:
+            (B, D, H, W) with B=1, or (D, H, W), or (D,)
+
+        Output:
+            (D,) if summary_stats == "mean"
+            (2D,) if summary_stats == "mean_std"
+        """
         if embedding.dim() == 4:
-            return embedding.mean(dim=(0, 2, 3))
+            # (1, D, H, W) → pool over H, W
+            pooled = embedding.mean(dim=(2, 3))  # (1, D)
+            spatial_mean = pooled.squeeze(0)       # (D,)
+
+            if self.task == "segmentation" and self.summary_stats == "mean_std":
+                # For a single image, compute std over spatial locations
+                # embedding is (1, D, H, W) → (D, H*W)
+                flat = embedding.squeeze(0).flatten(1)  # (D, H*W)
+                spatial_std = flat.std(dim=1)            # (D,)
+                return torch.cat([spatial_mean, spatial_std], dim=0)  # (2D,)
+            else:
+                return spatial_mean
+
         elif embedding.dim() == 3:
-            return embedding.mean(dim=(1, 2))
+            # (D, H, W)
+            spatial_mean = embedding.mean(dim=(1, 2))  # (D,)
+
+            if self.task == "segmentation" and self.summary_stats == "mean_std":
+                flat = embedding.flatten(1)      # (D, H*W)
+                spatial_std = flat.std(dim=1)    # (D,)
+                return torch.cat([spatial_mean, spatial_std], dim=0)  # (2D,)
+            else:
+                return spatial_mean
         else:
+            # Already a vector (D,)
+            if self.task == "segmentation" and self.summary_stats == "mean_std":
+                # No spatial info available, pad with zeros
+                return torch.cat([embedding, torch.zeros_like(embedding)], dim=0)
             return embedding
 
     def sample_theta(self, mu, log_sigma):

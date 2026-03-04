@@ -20,7 +20,7 @@ class EchonetDynamic(Dataset):
 
         file_names = os.listdir(root)
 
-        # self.examples = [os.path.join(root, file_name) for file_name in file_names][:200]
+        # self.examples = [os.path.join(root, file_name) for file_name in file_names][:500]
         self.examples = [os.path.join(root, file_name) for file_name in file_names]
         self.transform = transform
 
