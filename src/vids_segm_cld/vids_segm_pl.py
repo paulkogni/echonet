@@ -260,14 +260,21 @@ class AdaptivePrior(nn.Module):
     #     # test_energy = test_log_probs.mean()
     #     return train_energy + test_energy
     def _energy_segmentation(self, train_logits, test_logits):
-        # Per Eq. 4: integrate over y, sum over data points
-        # For binary seg: sum over classes, MEAN over pixels, then sum over images
-        train_log_probs = F.log_softmax(train_logits, dim=1)  # (B, C, H, W)
-        # Sum over classes (the integral over y), mean over pixels, sum over batch
-        train_energy = train_log_probs.sum(dim=1).mean(dim=(1, 2)).sum()
+        train_probs = F.softmax(train_logits, dim=1)
+        train_log_probs = torch.log(train_probs + 1e-8)
+        # train_energy = (train_probs * train_log_probs).sum(dim=1).mean(dim=(1, 2)).sum()
+        train_energy = (train_probs * train_log_probs).sum(dim=1).mean()
+
+        test_probs = F.softmax(test_logits, dim=1)
+        test_log_probs = torch.log(test_probs + 1e-8)
+        # test_energy = (test_probs * test_log_probs).sum(dim=1).mean(dim=(1, 2)).sum()
+        test_energy = (test_probs * test_log_probs).sum(dim=1).mean()
         
-        test_log_probs = F.log_softmax(test_logits, dim=1)
-        test_energy = test_log_probs.sum(dim=1).mean(dim=(1, 2)).sum()
+        # train_log_probs = F.log_softmax(train_logits, dim=1)  # (B, C, H, W)
+        # train_energy = train_log_probs.sum(dim=1).mean(dim=(1, 2)).sum()
+        
+        # test_log_probs = F.log_softmax(test_logits, dim=1)
+        # test_energy = test_log_probs.sum(dim=1).mean(dim=(1, 2)).sum()
         
         return train_energy + test_energy
 
@@ -324,7 +331,11 @@ class ELBOComputer(nn.Module):
         # log_q_sample = torch.mean(
         #     -0.5 * ((theta - mu) / sigma) ** 2 - log_sigma - 0.5 * math.log(2 * math.pi)
         # )
-        log_q_sample = torch.sum(
+        # log_q_sample = torch.sum(
+        #     -0.5 * ((theta - mu) / sigma) ** 2 - log_sigma - 0.5 * math.log(2 * math.pi)
+        # )
+        # debug: take mean instead of sum
+        log_q_sample = torch.mean(
             -0.5 * ((theta - mu) / sigma) ** 2 - log_sigma - 0.5 * math.log(2 * math.pi)
         )
         return log_lik + self.kl_weight * (log_prior - log_q_sample)
@@ -335,6 +346,7 @@ class ELBOComputer(nn.Module):
         test_logits = prediction_head(test_x_emb, theta)
         log_prior = self.prior.log_prior(train_logits, test_logits)
         sigma = torch.exp(log_sigma)
+
         log_q_sample = torch.sum(
             -0.5 * ((theta - mu) / sigma) ** 2 - log_sigma - 0.5 * math.log(2 * math.pi)
         )
@@ -347,14 +359,24 @@ class ELBOComputer(nn.Module):
             return -0.5 * torch.sum((preds - targets) ** 2)
 
     def _log_likelihood_segmentation(self, logits, targets):
-        criterion = torch.nn.CrossEntropyLoss(reduction='none')
+        # criterion = torch.nn.CrossEntropyLoss(reduction='none')
+        # debug: reduction over mean
+        # criterion = torch.nn.CrossEntropyLoss(reduction='mean')
+        # batch_size = logits.shape[0]
+        # logits_flat = logits.view(batch_size, self.num_classes, -1)
+        # targets_flat = targets.view(batch_size, -1).long()
+        # # return -F.cross_entropy(logits, targets.long(), reduction="mean")
+        # # return -torch.mean(
+        # #     torch.sum(F.cross_entropy(logits_flat, targets_flat), dim=1)
+        # # )
+        # return -torch.mean(
+        #     torch.sum(criterion(target=targets_flat, input=logits_flat), dim=1)
+        # )
+        criterion = nn.CrossEntropyLoss(reduction='mean')
         batch_size = logits.shape[0]
         logits_flat = logits.view(batch_size, self.num_classes, -1)
         targets_flat = targets.view(batch_size, -1).long()
-        # return -F.cross_entropy(logits, targets.long(), reduction="mean")
-        return torch.mean(
-            torch.sum(criterion(target=targets_flat, input=logits_flat), dim=1)
-        )
+        return -criterion(input=logits_flat, target=targets_flat)
 
 
 # =============================================================================
@@ -883,246 +905,160 @@ class VIDS(L.LightningModule):
         return optimizer
 
 
-# =============================================================================
-# 9. Pre-training utilities (unchanged — run OUTSIDE Lightning)
-# =============================================================================
 
-def pretrain_embedding(
-    embedding_net, prediction_head_pretrain,
-    train_x, train_y,
-    task="regression", epochs=100, lr=1e-3, batch_size=64,
-):
-    """Pre-train the embedding network (no Lightning, no logging)."""
-    device = train_x.device
-    model = nn.Sequential(embedding_net, prediction_head_pretrain).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
-    dataset = torch.utils.data.TensorDataset(train_x, train_y)
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+class PretrainSegmentationEmbedding(L.LightningModule):
+    """
+    Lightning module that wraps UNetDenseEmbedding + a 1x1 conv head
+    for pre-training the embedding network on segmentation.
+    
+    After training, extract `self.embedding_net` and freeze it for VIDS.
+    """
 
-    model.train()
-    for epoch in range(epochs):
-        total_loss = 0.0
-        n_batches = 0
-        for x_batch, y_batch in loader:
-            optimizer.zero_grad()
-            preds = model(x_batch)
-            if task in ("classification", "segmentation"):
-                loss = F.cross_entropy(preds, y_batch.long())
-            else:
-                loss = F.mse_loss(preds, y_batch)
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
-            n_batches += 1
+    def __init__(
+        self,
+        embedding_net: UNetDenseEmbedding,
+        num_classes: int = 2,
+        lr: float = 1e-4,
+        class_weights: Optional[torch.Tensor] = None,
+        dice_alpha: float = 0.5,
+    ):
+        super().__init__()
+        self.save_hyperparameters(ignore=["embedding_net", "class_weights"])
 
-        if (epoch + 1) % max(1, epochs // 10) == 0:
-            avg_loss = total_loss / n_batches
-            print(f"  Pre-train Epoch {epoch+1}/{epochs}, Loss: {avg_loss:.6f}")
+        self.embedding_net = embedding_net
+        self.pretrain_head = nn.Conv2d(
+            embedding_net.embedding_dim, num_classes, kernel_size=1
+        )
+        self.num_classes = num_classes
+        self.lr = lr
+        self.class_weights = class_weights
+        self.dice_alpha = dice_alpha
 
-    model.eval()
-    with torch.no_grad():
-        if task == "segmentation":
-            sample_x = train_x[:min(8, len(train_x))]
-            sample_y = train_y[:min(8, len(train_y))]
-            sample_preds = model(sample_x)
-            sample_loss = F.cross_entropy(sample_preds, sample_y.long())
-            pred_masks = sample_preds.argmax(dim=1)
-            accuracy = (pred_masks == sample_y.long()).float().mean()
-            print(f"  Final train CE: {sample_loss.item():.6f}, pixel acc: {accuracy.item():.4f}")
-        elif task == "classification":
-            final_preds = model(train_x)
-            final_loss = F.cross_entropy(final_preds, train_y.long())
-            print(f"  Final train CE: {final_loss.item():.6f}")
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        embeddings = self.embedding_net(x)
+        logits = self.pretrain_head(embeddings)
+        return logits
+
+    # -----------------------------------------------------------------
+    # Loss & metrics (mirroring your UNet)
+    # -----------------------------------------------------------------
+
+    def loss(self, pred: torch.Tensor, target: torch.Tensor, smooth: float = 1e-6) -> torch.Tensor:
+        # Cross-Entropy
+        ce_loss_fn = nn.CrossEntropyLoss(weight=self.class_weights, reduction="mean")
+        ce_loss = ce_loss_fn(pred, target.long())
+
+        # Dice Loss
+        pred_soft = torch.softmax(pred, dim=1)
+        target_one_hot = F.one_hot(target.long(), num_classes=self.num_classes)
+        target_one_hot = target_one_hot.permute(0, 3, 1, 2).float()
+
+        intersection = torch.sum(pred_soft * target_one_hot, dim=(2, 3))
+        union = torch.sum(pred_soft + target_one_hot, dim=(2, 3))
+        dice_score = (2 * intersection + smooth) / (union + smooth)
+        dice_loss = 1 - dice_score.mean()# * 0
+
+        return self.dice_alpha * ce_loss + (1 - self.dice_alpha) * dice_loss
+
+    def dice_coefficient(self, pred: torch.Tensor, target: torch.Tensor, smooth: float = 1e-6) -> torch.Tensor:
+        pred_soft = torch.softmax(pred, dim=1)
+        target_one_hot = F.one_hot(target.long(), num_classes=self.num_classes)
+        target_one_hot = target_one_hot.permute(0, 3, 1, 2).float()
+
+        intersection = torch.sum(pred_soft * target_one_hot, dim=(2, 3))
+        union = torch.sum(pred_soft + target_one_hot, dim=(2, 3))
+        dice_score = (2 * intersection + smooth) / (union + smooth)
+        return dice_score.mean()
+
+    # -----------------------------------------------------------------
+    # Image logging (mirroring your UNet)
+    # -----------------------------------------------------------------
+
+    def _create_overlay_image(self, image, mask, alpha=0.5):
+        if image.shape[0] == 1:
+            image_rgb = image.repeat(3, 1, 1)
         else:
-            final_preds = model(train_x)
-            final_mse = F.mse_loss(final_preds, train_y)
-            print(f"  Final train MSE: {final_mse.item():.6f}")
+            image_rgb = image.clone()
 
-    embedding_net.eval()
-    for param in embedding_net.parameters():
-        param.requires_grad = False
-    return embedding_net, model
+        if image_rgb.max() > 1.0:
+            image_rgb = image_rgb / 255.0
 
+        colored_mask = torch.zeros(3, mask.shape[0], mask.shape[1], device=mask.device)
+        colored_mask[0][mask == 1] = 1.0  # Red for class 1
 
-def pretrain_segmentation_embedding(
-    embedding_net: UNetDenseEmbedding,
-    loader,
-    num_classes: int = 2,
-    epochs: int = 100,
-    lr: float = 1e-4,
-    class_weights: Optional[torch.Tensor] = None,
-    dice_alpha: float = 0.5,
-):
-    """
-    Pre-train segmentation embedding with CE + Dice loss.
-    Runs OUTSIDE Lightning — no logging.
-    """
-    # device = "cpu"
-    device = 'cuda'
+        overlay = (1 - alpha) * image_rgb + alpha * colored_mask
+        return torch.clamp(overlay, 0, 1)
 
-    pretrain_head = nn.Conv2d(
-        embedding_net.embedding_dim, num_classes, kernel_size=1
-    ).to(device)
+    def _log_images(self, batch, pred, stage="train"):
+        if not self.logger:
+            return
 
-    model = nn.Sequential(embedding_net, pretrain_head).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+        x, y = batch
+        img = x[0].cpu()
+        gt_mask = y[0].cpu()
+        pred_mask = torch.argmax(torch.softmax(pred[0], dim=0), dim=0).cpu()
 
-    smooth = 1e-6
+        gt_overlay = self._create_overlay_image(img, gt_mask)
+        pred_overlay = self._create_overlay_image(img, pred_mask)
 
-    model.train()
-    for epoch in range(epochs):
-        print("Epoch:", epoch)
-        total_loss = 0.0
-        total_dice = 0.0
-        n_batches = 0
-
-        for x_batch, y_batch in loader:
-            x_batch, y_batch = x_batch.to(device), y_batch.to(device)
-            optimizer.zero_grad()
-            logits = model(x_batch)
-
-            ce_loss = F.cross_entropy(
-                logits, y_batch.long(), weight=class_weights, reduction="mean"
-            )
-
-            pred_soft = torch.softmax(logits, dim=1)
-            target_one_hot = F.one_hot(
-                y_batch.long(), num_classes=num_classes
-            ).permute(0, 3, 1, 2).float()
-
-            intersection = torch.sum(pred_soft * target_one_hot, dim=(2, 3))
-            union = torch.sum(pred_soft + target_one_hot, dim=(2, 3))
-            dice_score = (2 * intersection + smooth) / (union + smooth)
-            dice_loss = 1 - dice_score.mean()
-
-            loss = dice_alpha * ce_loss + (1 - dice_alpha) * dice_loss
-
-            loss.backward()
-            optimizer.step()
-
-            total_loss += loss.item()
-            total_dice += dice_score.mean().item()
-            n_batches += 1
-
-        avg_loss = total_loss / n_batches
-        avg_dice = total_dice / n_batches
-        print(
-            f"  Pre-train Epoch {epoch+1}/{epochs}, "
-            f"Loss: {avg_loss:.6f}, Dice: {avg_dice:.4f}"
+        self.logger.experiment.add_image(
+            f"{stage}/input_image", img, self.current_epoch
+        )
+        self.logger.experiment.add_image(
+            f"{stage}/ground_truth_overlay", gt_overlay, self.current_epoch
+        )
+        self.logger.experiment.add_image(
+            f"{stage}/prediction_overlay", pred_overlay, self.current_epoch
         )
 
-    embedding_net.eval()
-    for param in embedding_net.parameters():
-        param.requires_grad = False
-    return embedding_net, model
+    # -----------------------------------------------------------------
+    # Lightning steps
+    # -----------------------------------------------------------------
 
+    def training_step(self, batch, batch_idx):
+        x, y = batch
+        pred = self.forward(x)
+        loss = self.loss(pred, y)
+        dice = self.dice_coefficient(pred, y)
 
-# =============================================================================
-# 10. Example usage with Lightning Trainer
-# =============================================================================
+        self.log("train_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
+        self.log("train_dice", dice, on_step=False, on_epoch=True, prog_bar=True)
 
-def example_segmentation_lightning():
-    """
-    Example showing how to use VIDS with PyTorch Lightning for segmentation.
-    """
-    import lightning as L
-    from torch.utils.data import TensorDataset, DataLoader
+        if batch_idx == 0:
+            self._log_images(batch, pred, stage="train")
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        return loss
 
-    # --- Hyperparameters ---
-    n_channels = 1
-    num_classes = 2
-    embedding_dim = 32
-    H, W = 128, 128
-    N_train = 50
+    def validation_step(self, batch, batch_idx):
+        x, y = batch
+        pred = self.forward(x)
+        loss = self.loss(pred, y)
+        dice = self.dice_coefficient(pred, y)
 
-    # --- Create dummy data ---
-    train_x = torch.randn(N_train, n_channels, H, W)
-    train_y = torch.randint(0, num_classes, (N_train, H, W))
+        self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
+        self.log("val_dice", dice, on_step=False, on_epoch=True, prog_bar=True)
 
-    train_dataset = TensorDataset(train_x, train_y)
-    train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True)
-    val_loader = DataLoader(train_dataset, batch_size=8, shuffle=False)
+        if batch_idx == 0:
+            self._log_images(batch, pred, stage="val")
 
-    # --- Step 1: Pre-train embedding network (outside Lightning, no logging) ---
-    print("Step 1: Pre-training embedding network...")
-    embedding_net = UNetDenseEmbedding(
-        n_channels=n_channels,
-        embedding_dim=embedding_dim,
-        bilinear=False,
-    )
+        return loss
 
-    embedding_net, _ = pretrain_segmentation_embedding(
-        embedding_net=embedding_net,
-        loader=train_loader,
-        num_classes=num_classes,
-        epochs=5,
-        lr=1e-4,
-    )
+    def configure_optimizers(self):
+        optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
+        return optimizer
 
-    # --- Step 2: Create VIDS Lightning module ---
-    print("\nStep 2: Creating VIDS Lightning model...")
-    inference_hidden = [256, 128, 64]
+    def make_prediction(self, img):
+        out = self.forward(img)
+        return torch.argmax(torch.softmax(out, dim=1), dim=1).squeeze()
 
-    vids_model = VIDS(
-        embedding_net=embedding_net,
-        embedding_dim=embedding_dim,
-        output_dim=num_classes,
-        task="segmentation",
-        inference_hidden_dims=inference_hidden,
-        kl_weight=0.001,
-        variance_penalty=0.001,
-        num_classes=num_classes,
-        learning_rate=1e-3,
-        num_environments=3,
-        env_train_size=10,
-        env_test_size=2,
-        num_prediction_samples=50,
-    )
+    # -----------------------------------------------------------------
+    # Convenience: freeze and return the embedding net
+    # -----------------------------------------------------------------
 
-    print(f"  Prediction head params (θ): {vids_model.prediction_head.num_params}")
-    print(
-        f"  Inference network params: "
-        f"{sum(p.numel() for p in vids_model.inference_net.parameters())}"
-    )
-
-    # --- Step 3: Train with Lightning Trainer ---
-    print("\nStep 3: Training VIDS with Lightning Trainer...")
-    trainer = L.Trainer(
-        max_epochs=5,
-        accelerator="auto",
-        log_every_n_steps=1,
-    )
-    trainer.fit(vids_model, train_dataloaders=train_loader, val_dataloaders=val_loader)
-
-    # --- Step 4: Predict with uncertainty ---
-    print("\nStep 4: Making predictions...")
-    test_x = torch.randn(4, n_channels, H, W)
-    results = vids_model.predict_with_uncertainty(
-        train_x=train_x.to(vids_model.device),
-        test_x=test_x.to(vids_model.device),
-        num_samples=50,
-    )
-
-    print(f"  Predicted masks shape: {results['predicted_masks'].shape}")
-    print(f"  Mean probs shape: {results['predictions'].shape}")
-    print(f"  Uncertainty map shape: {results['uncertainty_map'].shape}")
-    print(f"  Epistemic uncertainty shape: {results['epistemic_uncertainty'].shape}")
-    print(f"  Aleatoric uncertainty shape: {results['aleatoric_uncertainty'].shape}")
-
-    for i in range(test_x.size(0)):
-        total_unc = results["uncertainty_map"][i].mean().item()
-        epist = results["epistemic_uncertainty"][i].mean().item()
-        aleat = results["aleatoric_uncertainty"][i].mean().item()
-        print(
-            f"  Image {i}: total_uncertainty={total_unc:.4f}, "
-            f"epistemic={epist:.4f}, aleatoric={aleat:.4f}"
-        )
-
-    return results
-
-
-if __name__ == "__main__":
-    example_segmentation_lightning()
+    def get_frozen_embedding_net(self) -> UNetDenseEmbedding:
+        """Call after training to get the frozen embedding network for VIDS."""
+        self.embedding_net.eval()
+        for param in self.embedding_net.parameters():
+            param.requires_grad = False
+        return self.embedding_net
