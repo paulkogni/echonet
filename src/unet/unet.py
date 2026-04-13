@@ -40,7 +40,7 @@ class UNet(L.LightningModule):
         logits = self.outc(x)
         return logits
 
-    def loss(self, pred, target, alpha=0.5, smooth=1e-6):
+    def loss(self, pred, target, alpha=1.0, smooth=1e-6):
         # Cross-Entropy
         ce_loss_fn = nn.CrossEntropyLoss(weight=self.class_weights, reduction="mean")
         ce_loss = ce_loss_fn(pred, target)

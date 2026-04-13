@@ -60,9 +60,9 @@ def load_data_into_loader(batch_size, path_dyn, path_ped, transform=None, shuffl
 
     # train_transform = RandomFlipRotate()  # Apply augmentation only for training
 
-    dataset = EchonetCombined(path_dyn, path_ped)
+    dataset = EchonetCombined(path_dyn, path_ped, transform=transform)
 
-    loader = DataLoader(dataset, batch_size=batch_size, drop_last=True, shuffle=True)
+    loader = DataLoader(dataset, batch_size=batch_size, drop_last=True, shuffle=shuffle)
 
     length = len(dataset)
     print("Number of samples:", length)
